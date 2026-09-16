@@ -254,3 +254,115 @@ class TestBaseAdapterClarifyFallback:
         assert "1." in text and "apple" in text
         assert "2." in text and "banana" in text
 
+
+
+# ===========================================================================
+# Multi-select: checkbox rows toggle in place, ✅ Done resolves
+# ===========================================================================
+
+def _multi_query(data: str, text: str = "Pick"):
+    query = AsyncMock()
+    query.data = data
+    query.message = MagicMock()
+    query.message.chat_id = 12345
+    query.message.text = text
+    query.from_user = MagicMock()
+    query.from_user.id = "777"
+    query.from_user.first_name = "Tester"
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    query.edit_message_reply_markup = AsyncMock()
+    update = MagicMock()
+    update.callback_query = query
+    return update, query
+
+
+class TestTelegramMultiSelectClarify:
+    def setup_method(self):
+        _clear_clarify_state()
+
+    @pytest.mark.asyncio
+    async def test_render_adds_hint_and_done_row(self):
+        from tools import clarify_gateway as cm
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 200
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+        cm.register("mid", "sk-m", "Which?", ["a", "b"], multi_select=True)
+        with patch("plugins.platforms.telegram.adapter.InlineKeyboardButton", side_effect=lambda label, callback_data: (label, callback_data)), \
+                patch("plugins.platforms.telegram.adapter.InlineKeyboardMarkup", side_effect=lambda rows: rows):
+            result = await adapter.send_clarify(
+                chat_id="12345", question="Which?", choices=["a", "b"], clarify_id="mid", session_key="sk-m")
+        assert result.success is True
+        kwargs = adapter._bot.send_message.call_args[1]
+        assert "then tap ✅ Done" in kwargs["text"]
+        rows = kwargs["reply_markup"]
+        assert rows[0] == [("☐ 1", "cl:mid:0")] and rows[1] == [("☐ 2", "cl:mid:1")]
+        assert rows[2] == [("✅ Done", "cl:mid:done")]
+        assert rows[3][0][1] == "cl:mid:other"
+
+    @pytest.mark.asyncio
+    async def test_toggle_repaints_keyboard_and_keeps_prompt_live(self):
+        from tools import clarify_gateway as cm
+        adapter = _make_adapter()
+        cm.register("mid", "sk-m", "Pick", ["red", "green"], multi_select=True)
+        adapter._clarify_state["mid"] = "sk-m"
+        update, query = _multi_query("cl:mid:1")
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False), \
+                patch("plugins.platforms.telegram.adapter.InlineKeyboardButton", side_effect=lambda label, callback_data: (label, callback_data)), \
+                patch("plugins.platforms.telegram.adapter.InlineKeyboardMarkup", side_effect=lambda rows: rows):
+            await adapter._handle_callback_query(update, MagicMock())
+        assert cm.selected_labels("mid") == ["green"]
+        assert "mid" in adapter._clarify_state  # still pending
+        rows = query.edit_message_reply_markup.call_args[1]["reply_markup"]
+        assert rows[0][0][0] == "☐ 1" and rows[1][0][0] == "☑ 2"
+        query.answer.assert_called_once_with(text="Selected: 2")
+        with cm._lock:
+            assert not cm._entries["mid"].event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_done_resolves_with_every_toggled_label(self):
+        from tools import clarify_gateway as cm
+        adapter = _make_adapter()
+        cm.register("mid", "sk-m", "Pick", ["red", "green", "blue"], multi_select=True)
+        adapter._clarify_state["mid"] = "sk-m"
+        cm.toggle_selection("mid", 0)
+        cm.toggle_selection("mid", 2)
+        update, query = _multi_query("cl:mid:done")
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+        assert "mid" not in adapter._clarify_state
+        with cm._lock:
+            entry = cm._entries["mid"]
+        assert entry.event.is_set() and entry.response == '["red", "blue"]'
+        query.edit_message_text.assert_called_once()
+        assert "red, blue" in query.edit_message_text.call_args[1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_done_with_nothing_selected_nudges(self):
+        from tools import clarify_gateway as cm
+        adapter = _make_adapter()
+        cm.register("mid", "sk-m", "Pick", ["red", "green"], multi_select=True)
+        adapter._clarify_state["mid"] = "sk-m"
+        update, query = _multi_query("cl:mid:done")
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+        query.answer.assert_called_once_with(text="Select at least one option first.")
+        assert "mid" in adapter._clarify_state
+        with cm._lock:
+            assert not cm._entries["mid"].event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_single_select_prompt_unchanged(self):
+        """A plain clarify still renders bare numeric rows and no Done button."""
+        from tools import clarify_gateway as cm
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 201
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+        cm.register("sid", "sk-s", "Which?", ["a"])
+        with patch("plugins.platforms.telegram.adapter.InlineKeyboardButton", side_effect=lambda label, callback_data: (label, callback_data)), \
+                patch("plugins.platforms.telegram.adapter.InlineKeyboardMarkup", side_effect=lambda rows: rows):
+            await adapter.send_clarify(chat_id="12345", question="Which?", choices=["a"], clarify_id="sid", session_key="sk-s")
+        rows = adapter._bot.send_message.call_args[1]["reply_markup"]
+        assert rows == [[("1", "cl:sid:0")], [("✏️ Other (type answer)", "cl:sid:other")]]

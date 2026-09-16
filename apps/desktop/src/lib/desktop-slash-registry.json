@@ -2,6 +2,7 @@
   "/approve": "messaging",
   "/busy": "terminal",
   "/clear": "terminal",
+  "/compare": "hidden",
   "/config": "terminal",
   "/copy": "terminal",
   "/cron": "terminal",

@@ -9,6 +9,7 @@ const buildOverlayState = (): OverlayState => ({
   approval: null,
   billing: null,
   clarify: null,
+  comparePicker: null,
   confirm: null,
   ambient: [],
   widget: null,
@@ -34,6 +35,7 @@ export const $isBlocked = computed(
     approval,
     billing,
     clarify,
+    comparePicker,
     confirm,
     journey,
     modelPicker,
@@ -53,6 +55,7 @@ export const $isBlocked = computed(
       approval ||
       billing ||
       clarify ||
+      comparePicker ||
       confirm ||
       journey ||
       modelPicker ||
@@ -84,7 +87,7 @@ export const $isBlocked = computed(
  *   (`ActiveWidgetSlot`, `sdk/host.tsx:209`, outside the ComposerPane
  *   subtree) so it can anchor the full-screen absolute `Overlay`
  *   (`components/overlay.tsx`) against the whole terminal.
- * - The FloatingOverlays set — `modelPicker`, `pager`, `petPicker`,
+ * - The FloatingOverlays set — `comparePicker`, `modelPicker`, `pager`, `petPicker`,
  *   `sessions`, `skillsHub`, `pluginsHub` — but ONLY when the rule sits at
  *   the top.  That panel is `position="absolute" bottom="100%"` inside
  *   ComposerPane's relative Box (`appOverlays.tsx:387`), so it grows UPWARD
@@ -122,6 +125,7 @@ export const $isBlocked = computed(
  */
 export const hasFloatingPanel = (overlay: OverlayState): boolean =>
   Boolean(
+    overlay.comparePicker ||
     overlay.modelPicker ||
     overlay.pager ||
     overlay.petPicker ||
@@ -158,6 +162,7 @@ export const resetFlowOverlays = () =>
     ambient: $overlayState.get().ambient,
     widget: $overlayState.get().widget,
     journey: $overlayState.get().journey,
+    comparePicker: $overlayState.get().comparePicker,
     modelPicker: $overlayState.get().modelPicker,
     petPicker: $overlayState.get().petPicker,
     pluginsHub: $overlayState.get().pluginsHub,

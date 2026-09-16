@@ -93,6 +93,21 @@ def _wrap_rows(wrap, items, width, indent) -> list[tuple[int, str]]:
     return [(i, w) for i, label in enumerate(items) for w in wrap(label, width, subsequent_indent=indent)]
 
 
+def _window_choice_rows(rows: list[tuple[int, str]], selected: int, budget: int) -> tuple[list[tuple[int, str]], int, int]:
+    """Slice ``rows`` (``_wrap_rows`` output) to ``budget`` lines around the choice ``selected``.
+    Returns ``(visible_rows, choices_hidden_above, choices_hidden_below)`` — counts are choices,
+    not wrapped lines, so the "N more" markers read naturally."""
+    if budget <= 0 or len(rows) <= budget:
+        return rows, 0, 0
+    positions = [n for n, (i, _w) in enumerate(rows) if i == selected]
+    anchor = positions[0] if positions else len(rows) - 1
+    offset = max(0, min(anchor - budget // 2, len(rows) - budget))
+    visible = rows[offset:offset + budget]
+    above = {i for i, _w in rows[:offset]}
+    below = {i for i, _w in rows[offset + budget:]}
+    return visible, len(above), len(below)
+
+
 class CLITuiMixin:
     """prompt_toolkit TUI construction, key-binding handlers, and overlay display fragments."""
 
@@ -541,7 +556,13 @@ class CLITuiMixin:
         # otherwise full chrome is kept when there is no room for it, the panel overflows and
         # HSplit silently clips the choices.
         available = max(0, _term_rows() - _PANEL_RESERVED_BELOW)
-        mandatory = len(choice_wrapped) + len(other_wrapped)
+        # A list longer than the viewport (the /compare checklist offers every configured model)
+        # scrolls: keep a window of rows around the cursor, with "N more" markers for the rest.
+        choice_budget = max(3, available - 2 - len(other_wrapped) - 2)  # compact chrome + 2 markers
+        choice_wrapped, hidden_above, hidden_below = _window_choice_rows(
+            choice_wrapped, other_idx if freetext else selected, choice_budget)
+        marker_rows = int(hidden_above > 0) + int(hidden_below > 0)
+        mandatory = len(choice_wrapped) + len(other_wrapped) + marker_rows
         use_compact_chrome = 5 + 1 + mandatory > available
         chrome_rows = 2 if use_compact_chrome else 5
         max_question_rows = min(12, max(1, available - chrome_rows - mandatory))  # soft cap on huge terminals
@@ -571,9 +592,13 @@ class CLITuiMixin:
             if not use_compact_chrome:
                 panel.blank()
         if choices:
+            if hidden_above:
+                panel.row('class:clarify-choice', f"    ↑ {hidden_above} more")
             for i, wrapped in choice_wrapped:
                 style = 'class:clarify-selected' if i == selected and not freetext else 'class:clarify-choice'
                 panel.row(style, wrapped)
+            if hidden_below:
+                panel.row('class:clarify-choice', f"    ↓ {hidden_below} more")
             if selected == other_idx and not freetext:
                 other_style = 'class:clarify-selected'
             elif freetext:

@@ -245,6 +245,10 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return patchOverlayState({ petPicker: false })
     }
 
+    if (overlay.comparePicker) {
+      return patchOverlayState({ comparePicker: null })
+    }
+
     if (overlay.billing) {
       return patchOverlayState({ billing: null })
     }

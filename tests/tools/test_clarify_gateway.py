@@ -8,6 +8,7 @@ machine: register, wait, resolve via button, resolve via text-fallback,
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -419,3 +420,68 @@ class TestNativeRejectClassification:
         )
         assert value is None
         assert reason == "prose"
+
+
+class TestMultiSelectSelectionState:
+    """Shared toggle/Done state behind the button and native-poll multi-select renderings."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def _register(self, cid="ms1", choices=("A", "B", "C")):
+        from tools import clarify_gateway as cm
+        return cm.register(cid, "sk-ms", "Pick some", list(choices), multi_select=True)
+
+    def test_toggle_on_off_keeps_tap_order(self):
+        from tools import clarify_gateway as cm
+        self._register()
+        assert cm.is_multi_select("ms1") is True
+        assert cm.toggle_selection("ms1", 2) == [2]
+        assert cm.toggle_selection("ms1", 0) == [2, 0]
+        assert cm.selected_labels("ms1") == ["C", "A"]
+        assert cm.toggle_selection("ms1", 2) == [0]
+
+    def test_toggle_rejects_unknown_single_select_and_out_of_range(self):
+        from tools import clarify_gateway as cm
+        cm.register("single", "sk", "Pick", ["A", "B"])
+        assert cm.toggle_selection("single", 0) is None
+        assert cm.is_multi_select("single") is False
+        self._register()
+        assert cm.toggle_selection("ms1", 7) is None
+        assert cm.toggle_selection("missing", 0) is None
+
+    def test_done_resolves_with_json_array_of_labels(self):
+        from tools import clarify_gateway as cm
+        entry = self._register()
+        assert cm.resolve_multi_selection("ms1") == ""  # nothing picked: stays armed
+        assert not entry.event.is_set()
+        cm.toggle_selection("ms1", 1)
+        cm.toggle_selection("ms1", 2)
+        assert cm.resolve_multi_selection("ms1") == json.dumps(["B", "C"])
+        assert entry.event.is_set() and entry.response == json.dumps(["B", "C"])
+        assert cm.wait_for_response("ms1", timeout=1) == json.dumps(["B", "C"])
+        # Resolved / unknown entries report None so adapters show "expired".
+        assert cm.resolve_multi_selection("ms1") is None
+        assert cm.resolve_multi_selection("nope") is None
+
+    def test_done_on_single_select_is_none(self):
+        from tools import clarify_gateway as cm
+        cm.register("single", "sk", "Pick", ["A"])
+        assert cm.resolve_multi_selection("single") is None
+
+    def test_toggle_by_label_for_native_polls(self):
+        from tools import clarify_gateway as cm
+        self._register(choices=("Alpha (Recommended)", "Beta"))
+        assert cm.toggle_selection_by_label("ms1", "beta") == [1]
+        # A retraction only ever toggles OFF; a repeated selection never flips it back off.
+        assert cm.toggle_selection_by_label("ms1", "Beta", selected=True) == [1]
+        assert cm.toggle_selection_by_label("ms1", "Beta", selected=False) == []
+        assert cm.toggle_selection_by_label("ms1", "Beta", selected=False) == []
+        assert cm.toggle_selection_by_label("ms1", "alpha") == [0]
+        assert cm.toggle_selection_by_label("ms1", "Gamma") is None
+
+    def test_toggle_after_resolution_is_refused(self):
+        from tools import clarify_gateway as cm
+        self._register()
+        cm.resolve_gateway_clarify("ms1", "A")
+        assert cm.toggle_selection("ms1", 0) is None

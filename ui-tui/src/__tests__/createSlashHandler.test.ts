@@ -91,6 +91,54 @@ describe('createSlashHandler', () => {
     expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
   })
 
+  it('prints usage for a bare /compare without touching the gateway', () => {
+    const ctx = buildCtx()
+
+    expect(createSlashHandler(ctx)('/compare')).toBe(true)
+    expect(ctx.transcript.sys).toHaveBeenCalledWith(expect.stringContaining('usage: /compare'))
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+    expect(getOverlayState().comparePicker).toBeNull()
+  })
+
+  it('opens the model checklist for /compare <prompt> and fans out on pick', async () => {
+    const request = vi.fn(() =>
+      Promise.resolve({ results: [{ elapsed_s: 1, label: 'a:b', ok: true, output_tokens: 2, text: 'hi' }] })
+    )
+
+    const ctx = buildCtx({ gateway: { ...buildGateway(), gw: { ...buildGateway().gw, request } } })
+    patchUiState({ sid: 'sid-1' })
+
+    expect(createSlashHandler(ctx)('/compare explain monads')).toBe(true)
+    expect(request).not.toHaveBeenCalled()
+    const picker = getOverlayState().comparePicker
+    expect(picker?.prompt).toBe('explain monads')
+
+    picker!.onPick(['a:b', 'c:d'])
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(request).toHaveBeenCalledWith(
+      'compare.run',
+      { candidates: ['a:b'], prompt: 'explain monads', session_id: 'sid-1' },
+      expect.any(Number)
+    )
+    await vi.waitFor(() => expect(ctx.transcript.panel).toHaveBeenCalledTimes(2))
+    expect(ctx.transcript.panel).toHaveBeenCalledWith('🔬 [1/2] a:b', [{ text: 'hi' }, { text: expect.any(String) }])
+    await vi.waitFor(() =>
+      expect(ctx.transcript.sys).toHaveBeenCalledWith(expect.stringContaining('📊 comparison summary'))
+    )
+  })
+
+  it('skips the checklist when /compare pins --models', async () => {
+    const request = vi.fn(() => Promise.reject(new Error('down')))
+    const ctx = buildCtx({ gateway: { ...buildGateway(), gw: { ...buildGateway().gw, request } } })
+
+    expect(createSlashHandler(ctx)('/compare --models a:b,a:b,c:d why?')).toBe(true)
+    expect(getOverlayState().comparePicker).toBeNull()
+    expect(request).toHaveBeenCalledTimes(2) // deduped
+    expect(request).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    await vi.waitFor(() => expect(ctx.transcript.panel).toHaveBeenCalledTimes(2))
+    expect(ctx.transcript.panel).toHaveBeenCalledWith('🔬 [1/2] a:b', [{ text: '❌ failed: down' }])
+  })
+
   it('handles /redraw locally without slash worker fallback', () => {
     const ctx = buildCtx()
 

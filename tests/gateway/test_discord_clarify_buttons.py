@@ -294,3 +294,95 @@ class TestDiscordSendClarify:
         for label in choice_labels:
             assert "only_name_here" not in label, f"name leaked: {label!r}"
             assert "only_value_here" not in label, f"value leaked: {label!r}"
+
+
+# ===========================================================================
+# Multi-select view: toggle buttons + ✅ Done
+# ===========================================================================
+
+class TestClarifyChoiceViewMultiSelect:
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def test_multi_view_renders_checkbox_labels_and_done(self):
+        view = ClarifyChoiceView(choices=["red", "green"], clarify_id="m1", allowed_user_ids=set(), multi_select=True)
+        labels = [child.label for child in view.children]
+        assert labels == ["☐ 1. red", "☐ 2. green", "✅ Done", "✏️ Other (type answer)"]
+        assert view.children[2].custom_id == "clarify:m1:done"
+
+    def test_multi_view_reserves_a_slot_for_done(self):
+        view = ClarifyChoiceView(choices=[f"c{i}" for i in range(30)], clarify_id="m2", allowed_user_ids=set(), multi_select=True)
+        assert len(view.choices) == 23 and len(view.children) == 25
+
+    @pytest.mark.asyncio
+    async def test_toggle_updates_entry_and_button_without_resolving(self):
+        from tools import clarify_gateway as cm
+        cm.register("m3", "sk", "Pick", ["red", "green"], multi_select=True)
+        view = ClarifyChoiceView(choices=["red", "green"], clarify_id="m3", allowed_user_ids={"42"}, multi_select=True)
+        interaction = _make_interaction()
+        await view.children[1].callback(interaction)
+        assert cm.selected_labels("m3") == ["green"]
+        assert view.children[1].label == "☑ 2. green"
+        assert view.resolved is False
+        interaction.response.edit_message.assert_awaited_once()
+        with cm._lock:
+            assert not cm._entries["m3"].event.is_set()
+        # Toggle back off.
+        await view.children[1].callback(interaction)
+        assert cm.selected_labels("m3") == [] and view.children[1].label == "☐ 2. green"
+
+    @pytest.mark.asyncio
+    async def test_done_resolves_with_json_array(self):
+        from tools import clarify_gateway as cm
+        cm.register("m4", "sk", "Pick", ["red", "green", "blue"], multi_select=True)
+        view = ClarifyChoiceView(choices=["red", "green", "blue"], clarify_id="m4", allowed_user_ids={"42"}, multi_select=True)
+        interaction = _make_interaction()
+        await view.children[0].callback(interaction)
+        await view.children[2].callback(interaction)
+        await view.children[3].callback(interaction)  # Done
+        with cm._lock:
+            entry = cm._entries["m4"]
+        assert entry.event.is_set() and entry.response == '["red", "blue"]'
+        assert view.resolved is True
+        assert all(child.disabled for child in view.children)
+
+    @pytest.mark.asyncio
+    async def test_done_with_nothing_selected_is_ephemeral_nudge(self):
+        from tools import clarify_gateway as cm
+        cm.register("m5", "sk", "Pick", ["red"], multi_select=True)
+        view = ClarifyChoiceView(choices=["red"], clarify_id="m5", allowed_user_ids={"42"}, multi_select=True)
+        interaction = _make_interaction()
+        await view.children[1].callback(interaction)  # Done
+        interaction.response.send_message.assert_awaited_once()
+        assert interaction.response.send_message.call_args[1]["ephemeral"] is True
+        assert view.resolved is False
+        with cm._lock:
+            assert not cm._entries["m5"].event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_toggle_rejected(self):
+        from tools import clarify_gateway as cm
+        cm.register("m6", "sk", "Pick", ["red"], multi_select=True)
+        view = ClarifyChoiceView(choices=["red"], clarify_id="m6", allowed_user_ids={"42"}, multi_select=True)
+        interaction = _make_interaction(user_id="999")
+        await view.children[0].callback(interaction)
+        assert cm.selected_labels("m6") == []
+        interaction.response.send_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_clarify_passes_multi_select_from_the_entry(self):
+        from tools import clarify_gateway as cm
+        cm.register("m7", "sk", "Pick", ["red", "green"], multi_select=True)
+        adapter = _make_adapter()
+        captured = {}
+
+        async def fake_send_prompt(chat_id, metadata, build, fail_log=None):
+            send_kwargs, view = build(MagicMock())
+            captured["view"] = view
+            captured["kwargs"] = send_kwargs
+            return MagicMock(success=True)
+
+        adapter._send_prompt = fake_send_prompt
+        await adapter.send_clarify(chat_id="1", question="Pick", choices=["red", "green"], clarify_id="m7", session_key="sk")
+        assert captured["view"].multi_select is True
+        assert "✅ Done" in captured["kwargs"]["content"]

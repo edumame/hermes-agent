@@ -10,6 +10,7 @@ import { $uiSessionId, $uiTheme } from '../app/uiStore.js'
 import { ActiveSessionSwitcher } from './activeSessionSwitcher.js'
 import { FloatBox } from './appChrome.js'
 import { BillingOverlay } from './billingOverlay.js'
+import { ComparePicker } from './comparePicker.js'
 import { MaskedPrompt } from './maskedPrompt.js'
 import { ModelPicker } from './modelPicker.js'
 import { OverlayHint } from './overlayControls.js'
@@ -287,6 +288,30 @@ export function FloatingOverlays({
       render: width => (
         <FloatBox color={theme.color.border}>
           <PetPicker gw={gw} maxWidth={width} onClose={() => patchOverlayState({ petPicker: false })} t={theme} />
+        </FloatBox>
+      )
+    })
+  }
+
+  if (overlay.comparePicker) {
+    const req = overlay.comparePicker
+
+    widgets.push({
+      id: 'compare-picker',
+      render: width => (
+        <FloatBox color={theme.color.border}>
+          <ComparePicker
+            gw={gw}
+            maxWidth={width}
+            onCancel={() => patchOverlayState({ comparePicker: null })}
+            onPick={labels => {
+              patchOverlayState({ comparePicker: null })
+              req.onPick(labels)
+            }}
+            prompt={req.prompt}
+            sessionId={sid}
+            t={theme}
+          />
         </FloatBox>
       )
     })

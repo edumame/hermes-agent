@@ -148,3 +148,83 @@ async def test_send_clarify_with_choices_sends_native_poll(
     assert marked == ["clar-1"]
 
 
+
+
+# ---------------------------------------------------------------------------
+# Multi-select: the poll grows a Done row, votes are tagged for the gateway.
+
+
+def _clear_clarify_state():
+    import tools.clarify_gateway as cg
+    with cg._lock:
+        cg._entries.clear()
+        cg._session_index.clear()
+        cg._notify_cbs.clear()
+
+
+@pytest.mark.asyncio
+async def test_multi_select_poll_appends_done_row_and_stays_in_choice_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.clarify_gateway as cg
+    _clear_clarify_state()
+    adapter = _make_adapter(monkeypatch)
+    poll_calls = _stub_sidecar_poll(adapter, monkeypatch)
+    entry = cg.register("pm1", "sk", "Pick", ["A", "B"], multi_select=True)
+
+    result = await adapter.send_clarify(
+        chat_id="+1", question="Pick", choices=["A", "B"], clarify_id="pm1", session_key="sk")
+
+    assert result.success is True
+    assert poll_calls == [("+1", "Pick", ["A", "B", cg.MULTI_SELECT_DONE_LABEL])]
+    # Not flipped to text capture: prose must not resolve a multi-select prompt.
+    assert entry.awaiting_text is False
+
+
+@pytest.mark.asyncio
+async def test_poll_votes_carry_poll_vote_metadata_including_retractions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+
+    await adapter._dispatch_inbound(_poll_option_event(title="A"))
+    await adapter._dispatch_inbound(_poll_option_event(title="A", selected=False, msg_id="m2"))
+
+    assert [(e.text, e.metadata["poll_vote"], e.metadata["poll_selected"]) for e in captured] == [
+        ("A", True, True), ("A", True, False)]
+
+
+class TestGatewayPollVoteIntercept:
+    """``GatewayRunner._hm_clarify_poll_vote`` — the gateway half of native-poll multi-select."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def _vote(self, pending, label, selected=True):
+        from gateway.run import GatewayRunner
+        return GatewayRunner._hm_clarify_poll_vote(pending, label, selected)
+
+    def test_multi_select_votes_toggle_and_done_resolves(self):
+        import tools.clarify_gateway as cg
+        entry = cg.register("gm1", "sk", "Pick", ["A", "B"], multi_select=True)
+        assert self._vote(entry, "B") == ""
+        assert self._vote(entry, "A") == ""
+        assert cg.selected_labels("gm1") == ["B", "A"]
+        assert self._vote(entry, "B", selected=False) == ""
+        assert cg.selected_labels("gm1") == ["A"]
+        assert not entry.event.is_set()
+        assert self._vote(entry, cg.MULTI_SELECT_DONE_LABEL) == ""
+        assert entry.event.is_set() and entry.response == '["A"]'
+
+    def test_done_with_nothing_selected_keeps_entry_armed(self):
+        import tools.clarify_gateway as cg
+        entry = cg.register("gm2", "sk", "Pick", ["A"], multi_select=True)
+        assert self._vote(entry, cg.MULTI_SELECT_DONE_LABEL) == ""
+        assert not entry.event.is_set()
+
+    def test_single_select_selection_falls_through_and_retraction_is_swallowed(self):
+        import tools.clarify_gateway as cg
+        entry = cg.register("gs1", "sk", "Pick", ["A"])
+        assert self._vote(entry, "A") is None
+        assert self._vote(entry, "A", selected=False) == ""

@@ -105,6 +105,10 @@ When connected to a remote gateway, opening a file artifact downloads it through
 
 The **Artifacts** view collects what your sessions generate — **images, files, and links** — into one searchable, browsable gallery. Open it from the sidebar, the command palette (**Artifacts — Browse generated outputs**), or a `nav.artifacts` shortcut you bind yourself. It indexes recent session outputs automatically; every artifact shows which session produced it with a jump back to that chat, and images and files open in a preview with download / open-in-browser / copy actions.
 
+### Compare page
+
+The sidebar's **Compare** page (`/compare`, also `Compare: Open` in the command palette) sends one prompt to several models at once and shows every answer in its own column as each model finishes, with time, token and cost stats per column. Add models with the same catalog menu the composer uses; the selection persists between launches. Nothing on this page touches a chat session: every column is a stateless request, so the conversation's model, history and prompt cache are untouched. The messaging twin is the `/compare` slash command.
+
 ### Windows, tabs & panes
 
 The app is built for working on several things at once:

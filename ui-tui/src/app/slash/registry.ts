@@ -1,3 +1,4 @@
+import { compareCommands } from './commands/compare.js'
 import { coreCommands } from './commands/core.js'
 import { debugCommands } from './commands/debug.js'
 import { opsCommands } from './commands/ops.js'
@@ -13,6 +14,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   ...topupCommands,
   ...sessionCommands,
   ...subscriptionCommands,
+  ...compareCommands,
   ...opsCommands,
   ...wakeCommands,
   ...setupCommands,

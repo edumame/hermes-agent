@@ -230,6 +230,7 @@ Common examples:
 | `/skills browse` | Browse the skills hub and official optional skills |
 | `/bg <prompt>` | Run a prompt in a separate background session |
 | `/btw <question>` | Ask a side question about the current conversation without interrupting it |
+| `/compare [--models a:b,c:d] <prompt>` | Send one prompt to several models and print every answer separately; without `--models` you pick from a scrolling checklist of every model on your configured providers |
 | `/skin` | Show or switch the active CLI skin |
 | `/voice on` | Enable CLI voice mode (press `Ctrl+B` to record) |
 | `/voice tts` | Toggle spoken playback for Hermes replies |

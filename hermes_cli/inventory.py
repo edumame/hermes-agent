@@ -68,6 +68,21 @@ def _without_slug(rows: list[dict], slug: str) -> list[dict]:
     return [r for r in rows if _slug(r) != slug]
 
 
+# ─── Public: /compare picker rows ───────────────────────────────────────
+
+
+def compare_provider_rows(ctx: ConfigContext, *, max_models: int | None = None, refresh: bool = False) -> list[dict]:
+    """Provider rows the ``/compare`` pickers (CLI checklist, TUI overlay, gateway poll) offer:
+    the providers the user set up (``explicit_only`` — a key, a Hermes sign-in, a Claude Code login,
+    a keyless provider), each with every model unless ``max_models`` caps a row for the chat poll's
+    button grid. Discovery-only rows are out: ``list_authenticated_providers`` counts an
+    external-process CLI as authenticated once its binary resolves on PATH (a VS Code Copilot shim
+    is enough), and offering such a row only produces an error panel when the comparison runs."""
+    payload = build_models_payload(
+        ctx, explicit_only=True, picker_hints=True, for_picker=True, max_models=max_models, refresh=refresh)
+    return [row for row in (payload.get("providers") or []) if row.get("authenticated", True)]
+
+
 # ─── Public: payload builder ────────────────────────────────────────────
 
 

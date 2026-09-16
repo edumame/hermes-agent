@@ -1579,6 +1579,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Block Kit requires unique IDs within an actions block.
         self._app.action(re.compile(r"^hermes_clarify_choice_\d+$"))(self._handle_clarify_action)
         self._app.action("hermes_clarify_other")(self._handle_clarify_action)
+        self._app.action("hermes_clarify_done")(self._handle_clarify_action)
         # Register Block Kit action handlers for the model picker
         # (provider/model static_select + Back/Cancel buttons).
         for _action_id in _MODEL_PICKER_ACTION_IDS:
@@ -5087,30 +5088,24 @@ class SlackAdapter(BasePlatformAdapter):
                 chat_id=chat_id, question=question, choices=choices, clarify_id=clarify_id,
                 session_key=session_key, metadata=metadata)
 
+        multi = False
+        try:
+            from tools.clarify_gateway import is_multi_select
+            multi = is_multi_select(clarify_id)
+        except Exception:
+            multi = False
+
         def _build() -> Tuple[str, list]:
             # Escape mrkdwn control chars so the question renders literally;
             # budget against the 3000-char section cap.
             q = (question or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             body = f"❓ {q}"
+            if multi:
+                body += "\n_Select one or more, then press ✅ Done._"
             budget = 3000 - len("...")
             if len(body) > budget:
                 body = body[:budget] + "..."
-            # Slack caps an actions block at 5 elements; clarify caps choices at 4 (+ Other) but
-            # chunk anyway so larger lists degrade gracefully instead of 400ing.
-            elements = []
-            for idx, choice in enumerate(choices):
-                label = str(choice).strip() or f"Option {idx + 1}"
-                elements.append(
-                    self._button(
-                        label[:75], f"hermes_clarify_choice_{idx}",
-                        f"{clarify_id}|{idx}", emoji=True))
-            elements.append(
-                self._button("✏️ Other…", "hermes_clarify_other", f"{clarify_id}|other", emoji=True)
-            )
-            blocks: list = [{"type": "section", "text": {"type": "mrkdwn", "text": body}}]
-            for start in range(0, len(elements), 5):
-                blocks.append({"type": "actions", "elements": elements[start : start + 5]})
-            return body, blocks
+            return body, self._clarify_blocks(body, list(choices), clarify_id, selected=[] if multi else None)
 
         # Bare-ts key (not workspace-scoped) so the action handler's atomic-pop guard
         # can reject double-clicks (mirrors _approval_resolved).
@@ -5312,6 +5307,41 @@ class SlackAdapter(BasePlatformAdapter):
             channel_id, msg_ts, self._section_text(message), decision_text,
             "Command approval request", "approval", team_id or None)
 
+    def _clarify_blocks(self, body: str, choices: list, clarify_id: str, selected: Optional[list] = None) -> list:
+        """Section + chunked action rows. ``selected`` (a list) renders the multi-select variant:
+        ``☐``/``☑`` prefixed toggle buttons (chosen rows styled primary) plus a ``✅ Done`` button.
+        Slack caps an actions block at 5 elements; chunk so larger lists degrade gracefully."""
+        multi = selected is not None
+        chosen = set(selected or ())
+        elements = []
+        for idx, choice in enumerate(choices):
+            label = str(choice).strip() or f"Option {idx + 1}"
+            if multi:
+                label = f"{'☑' if idx in chosen else '☐'} {label}"
+            elements.append(
+                self._button(
+                    label[:75], f"hermes_clarify_choice_{idx}", f"{clarify_id}|{idx}",
+                    style="primary" if (multi and idx in chosen) else "", emoji=True))
+        if multi:
+            elements.append(self._button("✅ Done", "hermes_clarify_done", f"{clarify_id}|done", emoji=True))
+        elements.append(
+            self._button("✏️ Other…", "hermes_clarify_other", f"{clarify_id}|other", emoji=True)
+        )
+        blocks: list = [{"type": "section", "text": {"type": "mrkdwn", "text": body}}]
+        for start in range(0, len(elements), 5):
+            blocks.append({"type": "actions", "elements": elements[start : start + 5]})
+        return blocks
+
+    async def _rerender_clarify_toggles(
+        self, channel_id: str, msg_ts: str, body: str, choices: list, clarify_id: str, selected: list) -> None:
+        """Repaint a multi-select prompt's buttons with the current check state (best effort)."""
+        try:
+            await self._get_client(channel_id).chat_update(
+                channel=channel_id, ts=msg_ts, text=body,
+                blocks=self._clarify_blocks(body, choices, clarify_id, selected=selected))
+        except Exception as exc:
+            logger.debug("[Slack] clarify toggle repaint failed (id=%s): %s", clarify_id, exc)
+
     async def _update_clarify_message(
         self, channel_id: str, msg_ts: str, question_text: str, decision_text: str) -> None:
         """Rewrite a clarify message to show the outcome and drop the buttons."""
@@ -5329,14 +5359,44 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning("[Slack] Malformed clarify value: %s", value)
             return
         clarify_id, token = value.split("|", 1)
+        from tools import clarify_gateway as _clarify_mod
+        original_text = self._section_text(message, limit=None)
+        expired_text = f"⏳ This prompt expired — please send a new request. (by {user_name})"
+        if token.isdigit() and _clarify_mod.is_multi_select(clarify_id):
+            # Multi-select toggle: the prompt stays live, so the double-click guard must stay armed
+            # (only Done / Other consume it below).
+            if self._clarify_resolved.get(msg_ts, True):
+                return
+            selected = _clarify_mod.toggle_selection(clarify_id, int(token))
+            if selected is None:
+                self._clarify_resolved.pop(msg_ts, None)
+                await self._update_clarify_message(channel_id, msg_ts, original_text, expired_text)
+                return
+            entry = _clarify_mod._entries.get(clarify_id)  # type: ignore[attr-defined]
+            await self._rerender_clarify_toggles(
+                channel_id, msg_ts, original_text, list(entry.choices or []) if entry else [], clarify_id, selected)
+            return
+        if token == "done":
+            if self._clarify_resolved.get(msg_ts, True):
+                return
+            labels = _clarify_mod.selected_labels(clarify_id)
+            resolved_value = _clarify_mod.resolve_multi_selection(clarify_id)
+            if resolved_value == "":
+                return  # nothing toggled yet: keep the prompt (and its guard) live
+            self._clarify_resolved.pop(msg_ts, None)
+            if resolved_value is None:
+                await self._update_clarify_message(channel_id, msg_ts, original_text, expired_text)
+                return
+            await self._update_clarify_message(
+                channel_id, msg_ts, original_text, f"✅ {user_name}: {', '.join(labels)}")
+            logger.info("Slack button resolved multi-select clarify (id=%s, count=%d, user=%s)",
+                        clarify_id, len(labels), user_name)
+            return
         # Double-click guard — atomic pop (mirrors approval).
         if self._clarify_resolved.pop(msg_ts, True):
             return
-        original_text = self._section_text(message, limit=None)
-        from tools import clarify_gateway as _clarify_mod
         # "Other" → text-capture mode: mark_awaiting_text flips the entry and the
         # gateway's text-intercept resolves it from the user's next message.
-        expired_text = f"⏳ This prompt expired — please send a new request. (by {user_name})"
         if action_id == "hermes_clarify_other" or token == "other":
             if not _clarify_mod.mark_awaiting_text(clarify_id):
                 # Entry evicted/gateway restarted — a typed answer would go nowhere.

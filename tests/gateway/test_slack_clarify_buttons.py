@@ -272,3 +272,107 @@ class TestBaseAdapterClarifyFallbackUnchanged:
         assert "Pick a fruit" in text
         assert "1." in text and "apple" in text
         assert "2." in text and "banana" in text
+
+
+# ===========================================================================
+# Multi-select: toggle buttons repaint in place, ✅ Done resolves
+# ===========================================================================
+
+class TestSlackMultiSelectClarify:
+    def setup_method(self):
+        _clear_clarify_state()
+
+    @pytest.mark.asyncio
+    async def test_render_has_checkbox_labels_done_and_hint(self):
+        from tools import clarify_gateway as cm
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "9.9"})
+        cm.register("ms1", "sk", "Which?", ["staging", "prod"], multi_select=True)
+        result = await adapter.send_clarify(
+            chat_id="C1", question="Which?", choices=["staging", "prod"], clarify_id="ms1", session_key="sk")
+        assert result.success is True
+        blocks = mock_client.chat_postMessage.call_args[1]["blocks"]
+        assert "then press ✅ Done" in blocks[0]["text"]["text"]
+        elements = blocks[1]["elements"]
+        assert [e["text"]["text"] for e in elements] == ["☐ staging", "☐ prod", "✅ Done", "✏️ Other…"]
+        assert elements[2]["action_id"] == "hermes_clarify_done" and elements[2]["value"] == "ms1|done"
+        assert adapter._clarify_resolved.get("9.9") is False
+
+    def _body(self, ts="9.9"):
+        return {
+            "message": {"ts": ts, "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "❓ Which?"}}]},
+            "channel": {"id": "C1"},
+            "user": {"name": "alice", "id": "U1"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_toggle_repaints_and_keeps_guard_armed(self):
+        from tools import clarify_gateway as cm
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        client = adapter._team_clients["T1"]
+        client.chat_update = AsyncMock()
+        cm.register("ms2", "sk", "Which?", ["staging", "prod"], multi_select=True)
+        adapter._clarify_resolved["9.9"] = False
+        await adapter._handle_clarify_action(
+            AsyncMock(), self._body(), {"action_id": "hermes_clarify_choice_1", "value": "ms2|1"})
+        assert cm.selected_labels("ms2") == ["prod"]
+        assert adapter._clarify_resolved.get("9.9") is False  # still live
+        blocks = client.chat_update.call_args[1]["blocks"]
+        labels = [e["text"]["text"] for e in blocks[1]["elements"]]
+        assert labels[:2] == ["☐ staging", "☑ prod"]
+        assert blocks[1]["elements"][1].get("style") == "primary"
+        with cm._lock:
+            assert not cm._entries["ms2"].event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_done_resolves_and_finalizes_message(self):
+        from tools import clarify_gateway as cm
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        client = adapter._team_clients["T1"]
+        client.chat_update = AsyncMock()
+        cm.register("ms3", "sk", "Which?", ["staging", "prod"], multi_select=True)
+        cm.toggle_selection("ms3", 0)
+        cm.toggle_selection("ms3", 1)
+        adapter._clarify_resolved["9.9"] = False
+        await adapter._handle_clarify_action(
+            AsyncMock(), self._body(), {"action_id": "hermes_clarify_done", "value": "ms3|done"})
+        with cm._lock:
+            entry = cm._entries["ms3"]
+        assert entry.event.is_set() and entry.response == '["staging", "prod"]'
+        assert "9.9" not in adapter._clarify_resolved
+        assert "alice: staging, prod" in client.chat_update.call_args[1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_done_with_nothing_selected_keeps_prompt(self):
+        from tools import clarify_gateway as cm
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        client = adapter._team_clients["T1"]
+        client.chat_update = AsyncMock()
+        cm.register("ms4", "sk", "Which?", ["staging"], multi_select=True)
+        adapter._clarify_resolved["9.9"] = False
+        await adapter._handle_clarify_action(
+            AsyncMock(), self._body(), {"action_id": "hermes_clarify_done", "value": "ms4|done"})
+        assert adapter._clarify_resolved.get("9.9") is False
+        client.chat_update.assert_not_called()
+        with cm._lock:
+            assert not cm._entries["ms4"].event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_expired_toggle_shows_expiry(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        client = adapter._team_clients["T1"]
+        client.chat_update = AsyncMock()
+        # Entry gone (gateway restart) but the message still carries the guard.
+        from tools import clarify_gateway as cm
+        cm.register("ms5", "sk", "Which?", ["a"], multi_select=True)
+        adapter._clarify_resolved["9.9"] = False
+        _clear_clarify_state()
+        await adapter._handle_clarify_action(
+            AsyncMock(), self._body(), {"action_id": "hermes_clarify_choice_0", "value": "ms5|0"})
+        assert "9.9" not in adapter._clarify_resolved
+        assert "expired" in client.chat_update.call_args[1]["text"]

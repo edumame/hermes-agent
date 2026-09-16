@@ -53,6 +53,8 @@ export interface SlashExecResponse {
 export interface CompareOptionsResponse {
   choices?: string[]
   current?: string
+  /** The last comparison's `provider:model` labels — the picker starts with them checked. */
+  selected?: string[]
 }
 
 export interface CompareRunResult {

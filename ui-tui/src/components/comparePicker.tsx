@@ -1,7 +1,7 @@
 import { Box, Text, useInput, useStdout } from '@hermes/ink'
 import { useEffect, useMemo, useState } from 'react'
 
-import { filterCompareChoices, MAX_COMPARE_CANDIDATES, toggleMember } from '../domain/compare.js'
+import { filterCompareChoices, MAX_COMPARE_CANDIDATES, preselectedChoices, toggleMember } from '../domain/compare.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type { CompareOptionsResponse } from '../gatewayTypes.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
@@ -19,7 +19,8 @@ const PROMPT_PREVIEW = 60
  * Multi-select model checklist for a bare `/compare <prompt>`. Pulls every row from
  * `compare.options` (the session's current route first, then each model of every provider
  * configured in this profile), narrows them as you type, toggles with Space and hands the checked
- * `provider:model` labels to `onPick`. The interactive sibling of `/compare --models a:b,c:d <prompt>`.
+ * `provider:model` labels to `onPick`. The last comparison's models (`selected`) start checked, so
+ * Enter alone repeats that set. The interactive sibling of `/compare --models a:b,c:d <prompt>`.
  */
 export function ComparePicker({ gw, maxWidth, onCancel, onPick, prompt, sessionId, t }: ComparePickerProps) {
   const [choices, setChoices] = useState<string[]>([])
@@ -37,8 +38,10 @@ export function ComparePicker({ gw, maxWidth, onCancel, onPick, prompt, sessionI
   useEffect(() => {
     gw.request<CompareOptionsResponse>('compare.options', { session_id: sessionId ?? '' })
       .then(r => {
-        setChoices(r?.choices ?? [])
+        const rows = r?.choices ?? []
+        setChoices(rows)
         setCurrent(r?.current ?? '')
+        setSelected(preselectedChoices(rows, r?.selected ?? []))
         setErr('')
       })
       .catch((e: unknown) => setErr(rpcErrorMessage(e)))

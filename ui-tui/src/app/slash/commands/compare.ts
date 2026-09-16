@@ -39,6 +39,9 @@ export function runComparison(ctx: SlashRunCtx, prompt: string, specs: readonly 
 
   sys(`🔬 comparing ${total} model${total === 1 ? '' : 's'}: ${labels.join(', ')} — answers appear as each finishes`)
 
+  // Remember the set so the next picker starts from it; best-effort, never blocks the run.
+  void ctx.gateway.gw.request('compare.remember', { candidates: labels }).catch(() => undefined)
+
   const show = (result: CompareRunResult) => {
     results.push(result)
     const title = `🔬 [${results.length}/${total}] ${result.label ?? result.model ?? '?'}`

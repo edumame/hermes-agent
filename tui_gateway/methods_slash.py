@@ -197,18 +197,22 @@ def _format_live_compare_output(sid: str, session: Optional[dict], arg: str) -> 
     can outlive the worker's 45s cap, and the worker only returns output after the whole command
     (#99065). Runs under the session's profile scope; the live agent's route is the default provider."""
     from agent.model_compare import (
-        SUGGEST_MODELS_PER_PROVIDER, format_comparison_text, parse_candidate_list, parse_compare_args,
-        run_comparison, suggest_candidate_labels,
+        SUGGEST_MODELS_PER_PROVIDER, format_comparison_text, load_saved_candidates, parse_candidate_list,
+        parse_compare_options, run_comparison, save_candidates, suggest_candidate_labels,
     )
-    specs, prompt = parse_compare_args(arg)
+    args = parse_compare_options(arg)
+    specs, prompt = list(args.specs), args.prompt
     if not prompt:
-        return ("Usage: /compare --models provider:model,provider:model <prompt>\n"
-                "Sends the prompt to every listed model and prints each answer separately.")
+        return ("Usage: /compare [--models provider:model,provider:model] [--pick] <prompt>\n"
+                "Sends the prompt to every listed model and prints each answer separately. Without --models "
+                "the last comparison's models are reused; --pick lists the available models instead.")
     agent = (session or {}).get("agent")
     provider = str(getattr(agent, "provider", "") or "") if agent is not None else ""
     model = str(getattr(agent, "model", "") or "") if agent is not None else ""
     scope = _session_profile_runtime_scope(session) if session is not None else contextlib.nullcontext()
     with scope:
+        if not specs and not args.pick:
+            specs = load_saved_candidates()  # the last comparison's models stand in for a bare prompt
         if not specs:
             try:  # explicitly configured providers only — same rows as the pickers
                 from hermes_cli.inventory import compare_provider_rows
@@ -225,6 +229,7 @@ def _format_live_compare_output(sid: str, session: Optional[dict], arg: str) -> 
         candidates = parse_candidate_list(specs, default_provider=provider)
         if not candidates:
             return "No valid models in --models."
+        save_candidates(candidates)
         results = run_comparison(candidates, prompt, timeout=_COMPARE_LIVE_TIMEOUT_S)
     return format_comparison_text(results)
 

@@ -820,25 +820,33 @@ class CLIModelSwitchMixin:
         return suggest_candidate_labels(
             providers, current_provider=provider, current_model=model, limit=None, per_provider=None)
 
-    def _compare_pick_models(self, rows: list[str]) -> list[str] | None:
+    def _compare_pick_models(self, rows: list[str], *, preselected: list[str] | None = None) -> list[str] | None:
         """Interactive picker for a bare ``/compare <prompt>``. Under the prompt_toolkit app it is
         the clarify checklist (Space / number toggles a row, Enter confirms, "Other" types a custom
-        ``provider:model``); on a plain TTY it is a numbered stdin prompt. Returns the chosen labels,
-        ``[]`` when the user cancelled or picked nothing, and ``None`` when this surface cannot
-        prompt at all (TUI slash worker, piped stdin, UI thread) so the caller prints the list."""
+        ``provider:model``); on a plain TTY it is a numbered stdin prompt. ``preselected`` (the
+        last comparison's models) start checked in the checklist and are what a blank stdin answer
+        reuses. Returns the chosen labels, ``[]`` when the user cancelled or picked nothing, and
+        ``None`` when this surface cannot prompt at all (TUI slash worker, piped stdin, UI thread)
+        so the caller prints the list."""
         from cli import _cprint
         from hermes_cli.cli_modal_mixin import _TIMED_OUT
 
         if not rows:
             return None
+        preselected = [p for p in (preselected or []) if p]
+        lowered = [row.lower() for row in rows]
+        checked = {lowered.index(p.lower()) for p in preselected if p.lower() in lowered}
         if getattr(self, "_app", None):
             if threading.current_thread() is threading.main_thread():
                 return None  # blocking the UI loop would freeze the modal we are about to show
             response_queue: queue.Queue = queue.Queue()
+            question = "Which models should answer? Space or a number toggles a row, Enter confirms."
+            if checked:
+                question += " (Last comparison's models are pre-checked.)"
             self._clarify_state = {
-                "question": "Which models should answer? Space or a number toggles a row, Enter confirms.",
-                "choices": list(rows), "selected": 0, "multi_select": True,
-                "selected_indices": set(), "response_queue": response_queue}
+                "question": question,
+                "choices": list(rows), "selected": min(checked) if checked else 0, "multi_select": True,
+                "selected_indices": set(checked), "response_queue": response_queue}
             self._clarify_deadline = _time.monotonic() + COMPARE_PICK_TIMEOUT_S
             self._clarify_freetext = False
             self._clarify_multi_base = None
@@ -861,8 +869,15 @@ class CLIModelSwitchMixin:
             return None
         _cprint("  Models available to compare:")
         for i, row in enumerate(rows, 1):
-            _cprint(f"    {i}. {row}")
-        raw = self._prompt_text_input("  Models to compare (numbers or provider:model, comma-separated; blank cancels): ")
+            _cprint(f"    {i}. {row}" + ("  (last)" if (i - 1) in checked else ""))
+        if preselected:
+            _cprint(f"  Last comparison: {', '.join(preselected)}")
+            raw = self._prompt_text_input(
+                "  Models to compare (numbers or provider:model, comma-separated; blank reuses the last): ")
+            if not str(raw or "").strip():
+                return list(preselected)
+        else:
+            raw = self._prompt_text_input("  Models to compare (numbers or provider:model, comma-separated; blank cancels): ")
         return _resolve_compare_picks(raw or "", rows)
 
     def _cmd_compare(self, cmd_original: str):
@@ -873,25 +888,33 @@ class CLIModelSwitchMixin:
         worker) the run is synchronous so its output is captured whole."""
         from cli import _cprint, _slash_args
         from agent.model_compare import (
-            MAX_COMPARE_CANDIDATES, format_result_message, format_summary_message, parse_candidate_list,
-            parse_compare_args, run_comparison,
+            MAX_COMPARE_CANDIDATES, format_result_message, format_summary_message, load_saved_candidates,
+            parse_candidate_list, parse_compare_options, run_comparison, save_candidates,
         )
         from hermes_cli.cli_commands_mixin import _ellipsize, _print_side_result_panel
 
-        specs, prompt = parse_compare_args(_slash_args(cmd_original))
+        args = parse_compare_options(_slash_args(cmd_original))
+        specs, prompt = list(args.specs), args.prompt
         if not prompt:
-            _cprint("  Usage: /compare [--models provider:model,provider:model] <prompt>")
+            _cprint("  Usage: /compare [--models provider:model,provider:model] [--pick] <prompt>")
             _cprint("  Example: /compare --models openrouter:openai/gpt-5,anthropic:claude-opus-5 explain monads")
             _cprint("  Sends the prompt to every listed model and prints each answer separately.")
-            _cprint("  Without --models you pick from a list of models on your configured providers.")
+            _cprint("  Without --models you pick from a list of models on your configured providers;")
+            _cprint("  the last comparison's models start checked (--pick opens the list even where a")
+            _cprint("  blank answer would reuse them).")
             return True
         if hasattr(self, "_ensure_runtime_credentials") and not self._ensure_runtime_credentials():
             _cprint("  (>_<) Cannot compare models: no valid credentials.")
             return True
         provider, _model = self._compare_route()
         if not specs:
+            saved = load_saved_candidates()
             rows = self._compare_suggestions()
-            picked = self._compare_pick_models(rows)
+            picked = self._compare_pick_models(rows, preselected=saved)
+            if picked is None and saved and not args.pick:
+                # No way to prompt here (slash worker, piped stdin): the last selection stands in.
+                _cprint(f"  Using the last comparison's models: {', '.join(saved)} (--models overrides)")
+                picked = list(saved)
             if picked is None:
                 # No way to prompt here (slash worker, piped stdin): print the list to pass back.
                 _cprint("  /compare needs the models to compare: --models provider:model,provider:model")
@@ -909,6 +932,7 @@ class CLIModelSwitchMixin:
         if not candidates:
             _cprint("  No valid models in --models.")
             return True
+        save_candidates(candidates)  # the next /compare starts from this selection
         if len(specs) > MAX_COMPARE_CANDIDATES:
             _cprint(f"  (only the first {MAX_COMPARE_CANDIDATES} models are compared)")
         total = len(candidates)

@@ -8,6 +8,9 @@ import type { CompareRunResult } from '../gatewayTypes.js'
  * the model picker or fan out straight away.
  */
 const MODELS_FLAG_RE = /(?:^|\s)--models?(?:=|\s+)(\S+)/
+// `--pick` re-opens the checklist on surfaces that would otherwise reuse the saved selection; the
+// TUI always opens it for a bare prompt, so the flag is only stripped here (never sent as prompt text).
+const PICK_FLAG_RE = /(?:^|\s)--(?:pick|choose)(?=\s|$)/g
 
 /** Fan-out cap, mirrored from `agent.model_compare.MAX_COMPARE_CANDIDATES`. */
 export const MAX_COMPARE_CANDIDATES = 8
@@ -18,7 +21,7 @@ export interface CompareArgs {
 }
 
 export function parseCompareArgs(raw: string): CompareArgs {
-  const text = (raw ?? '').trim()
+  const text = (raw ?? '').replace(PICK_FLAG_RE, ' ').split(/\s+/).filter(Boolean).join(' ')
   const match = MODELS_FLAG_RE.exec(text)
 
   if (!match) {
@@ -36,6 +39,23 @@ export function parseCompareArgs(raw: string): CompareArgs {
     .join(' ')
 
   return { prompt, specs }
+}
+
+/** The `choices` rows named by `saved` (the last comparison's labels, matched case-insensitively),
+ *  as the picker's initial checked set — capped at the fan-out limit; unknown labels are dropped. */
+export function preselectedChoices(choices: readonly string[], saved: readonly string[]): Set<string> {
+  const byKey = new Map(choices.map(c => [c.toLowerCase(), c] as const))
+  const out = new Set<string>()
+
+  for (const label of saved) {
+    const row = byKey.get(label.trim().toLowerCase())
+
+    if (row !== undefined && out.size < MAX_COMPARE_CANDIDATES) {
+      out.add(row)
+    }
+  }
+
+  return out
 }
 
 /** Case-insensitive dedupe (order preserved), capped at the fan-out limit. */

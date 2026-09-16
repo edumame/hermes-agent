@@ -114,12 +114,13 @@ describe('createSlashHandler', () => {
     expect(picker?.prompt).toBe('explain monads')
 
     picker!.onPick(['a:b', 'c:d'])
-    expect(request).toHaveBeenCalledTimes(2)
+    expect(request).toHaveBeenCalledTimes(3) // one run per model + remembering the set
     expect(request).toHaveBeenCalledWith(
       'compare.run',
       { candidates: ['a:b'], prompt: 'explain monads', session_id: 'sid-1' },
       expect.any(Number)
     )
+    expect(request).toHaveBeenCalledWith('compare.remember', { candidates: ['a:b', 'c:d'] })
     await vi.waitFor(() => expect(ctx.transcript.panel).toHaveBeenCalledTimes(2))
     expect(ctx.transcript.panel).toHaveBeenCalledWith('🔬 [1/2] a:b', [{ text: 'hi' }, { text: expect.any(String) }])
     await vi.waitFor(() =>
@@ -133,7 +134,8 @@ describe('createSlashHandler', () => {
 
     expect(createSlashHandler(ctx)('/compare --models a:b,a:b,c:d why?')).toBe(true)
     expect(getOverlayState().comparePicker).toBeNull()
-    expect(request).toHaveBeenCalledTimes(2) // deduped
+    expect(request).toHaveBeenCalledTimes(3) // deduped runs + remembering the set
+    expect(request).toHaveBeenCalledWith('compare.remember', { candidates: ['a:b', 'c:d'] })
     expect(request).not.toHaveBeenCalledWith('slash.exec', expect.anything())
     await vi.waitFor(() => expect(ctx.transcript.panel).toHaveBeenCalledTimes(2))
     expect(ctx.transcript.panel).toHaveBeenCalledWith('🔬 [1/2] a:b', [{ text: '❌ failed: down' }])

@@ -6,6 +6,11 @@ toggle rows + Done, native-poll adapters a multi-vote poll, everything else a nu
 text-intercept parses as ``1, 3``), then fans the prompt out through ``agent/model_compare.py``
 and posts each answer as it lands. ``--models a:b,c:d`` skips the poll. The live session is never
 touched: no history rows, no model switch, no prompt-cache impact (same contract as ``/btw``).
+
+The models of the last comparison are saved per profile (``agent.model_compare.save_candidates``):
+a later bare ``/compare <prompt>`` reuses them without a poll — button rows cannot be pre-toggled
+on a phone, so re-asking every time was the friction this removes — and ``--pick`` opens the
+poll again.
 """
 
 from __future__ import annotations
@@ -17,7 +22,8 @@ import uuid
 from typing import List
 
 from agent.model_compare import (
-    SUGGEST_MAX_LABELS, SUGGEST_MODELS_PER_PROVIDER, parse_compare_args, suggest_candidate_labels,
+    SUGGEST_MAX_LABELS, SUGGEST_MODELS_PER_PROVIDER, parse_compare_args, parse_compare_options,
+    suggest_candidate_labels,
 )
 from gateway.platforms.event import MessageEvent
 
@@ -61,9 +67,11 @@ class GatewayCompareCommandsMixin:
         prefix = self._typed_command_prefix_for(event.source.platform)
         return (
             f"Usage: {prefix}compare <prompt>\n"
-            f"       {prefix}compare --models openrouter:openai/gpt-5,anthropic:claude-opus-5 <prompt>\n\n"
+            f"       {prefix}compare --models openrouter:openai/gpt-5,anthropic:claude-opus-5 <prompt>\n"
+            f"       {prefix}compare --pick <prompt>\n\n"
             "Sends the prompt to several models and prints every answer separately so you can compare "
-            "them. Without --models you get a poll of models on your configured providers (select several, then Done)."
+            "them. Without --models you get a poll of models on your configured providers (select several, then Done). "
+            "The models you picked are remembered: the next bare compare reuses them, --pick asks again."
         )
 
     async def _compare_listing(self, event: MessageEvent, source, profile_home) -> tuple[List[dict], str, str]:
@@ -126,11 +134,12 @@ class GatewayCompareCommandsMixin:
     async def _handle_compare_command(self, event: MessageEvent) -> str:
         """Handle ``/compare [--models a:b,...] <prompt>``: poll (unless pinned), fan out, print."""
         from agent.model_compare import (
-            MAX_COMPARE_CANDIDATES, format_result_message, format_summary_message,
-            parse_candidate_list, run_comparison,
+            MAX_COMPARE_CANDIDATES, format_result_message, format_summary_message, load_saved_candidates,
+            parse_candidate_list, run_comparison, save_candidates,
         )
 
-        specs, prompt = parse_compare_args(event.get_command_args())
+        args = parse_compare_options(event.get_command_args())
+        specs, prompt = list(args.specs), args.prompt
         if not prompt:
             return self._compare_usage(event)
         source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
@@ -144,6 +153,8 @@ class GatewayCompareCommandsMixin:
             except Exception:
                 profile_home = None
         reply_metadata = self._reply_metadata(event)
+        from hermes_constants import get_hermes_home
+        selection_home = profile_home or get_hermes_home()
 
         def _scoped(fn, *args, **kwargs):
             if profile_home is None:
@@ -155,8 +166,12 @@ class GatewayCompareCommandsMixin:
         async def _run() -> None:
             try:
                 providers, current_provider, current_model = await self._compare_listing(event, source, profile_home)
+                saved = [] if (specs or args.pick) else load_saved_candidates(selection_home)
+                reused = bool(saved)
                 if specs:
                     labels = specs
+                elif saved:
+                    labels = saved
                 else:
                     choices = _poll_choices(providers, current_provider=current_provider, current_model=current_model)
                     if len(choices) < 2:
@@ -177,10 +192,13 @@ class GatewayCompareCommandsMixin:
                     return
                 if len(candidates) > MAX_COMPARE_CANDIDATES:
                     candidates = candidates[:MAX_COMPARE_CANDIDATES]
+                save_candidates(candidates, selection_home)  # the next bare /compare starts from these
                 names = ", ".join(c.display for c in candidates)
+                intro = (f"🔬 Comparing {len(candidates)} models (last selection): {names}\n"
+                         f"Add --pick to choose different models. " if reused
+                         else f"🔬 Comparing {len(candidates)} models: {names}\n")
                 await adapter.send(
-                    source.chat_id, f"🔬 Comparing {len(candidates)} models: {names}\nAnswers arrive as each model finishes…",
-                    metadata=reply_metadata)
+                    source.chat_id, f"{intro}Answers arrive as each model finishes…", metadata=reply_metadata)
                 loop = asyncio.get_running_loop()
                 total = len(candidates)
 

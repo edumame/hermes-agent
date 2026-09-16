@@ -7,6 +7,7 @@ import {
   formatCompareStats,
   MAX_COMPARE_CANDIDATES,
   parseCompareArgs,
+  preselectedChoices,
   toggleMember
 } from './compare.js'
 
@@ -25,6 +26,25 @@ describe('parseCompareArgs', () => {
 
   it('drops empty specs and leaves an empty prompt when only the flag was given', () => {
     expect(parseCompareArgs('--models a:b,,')).toEqual({ prompt: '', specs: ['a:b'] })
+  })
+
+  it('strips --pick / --choose (the checklist always opens here) without touching lookalikes', () => {
+    expect(parseCompareArgs('--pick explain monads')).toEqual({ prompt: 'explain monads', specs: [] })
+    expect(parseCompareArgs('explain --choose --models a:b monads')).toEqual({ prompt: 'explain monads', specs: ['a:b'] })
+    expect(parseCompareArgs('picky --pickle')).toEqual({ prompt: 'picky --pickle', specs: [] })
+  })
+})
+
+describe('preselectedChoices', () => {
+  it('checks the saved labels that are on offer, case-insensitively, capped at the fan-out', () => {
+    const choices = ['anthropic:cur', 'openrouter:x', 'openrouter:y']
+    expect([...preselectedChoices(choices, ['OpenRouter:X', ' openrouter:y ', 'gone:z'])]).toEqual([
+      'openrouter:x',
+      'openrouter:y'
+    ])
+    expect(preselectedChoices(choices, []).size).toBe(0)
+    const many = Array.from({ length: 12 }, (_, i) => `p:m${i}`)
+    expect(preselectedChoices(many, many).size).toBe(MAX_COMPARE_CANDIDATES)
   })
 })
 

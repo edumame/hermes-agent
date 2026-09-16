@@ -241,6 +241,103 @@ class TestHandleCompareCommand:
         assert adapter.sent == ["🟡 Comparison cancelled — no models were selected."]
 
 
+class TestSavedSelection:
+    """The models of the last comparison are remembered per profile: a bare /compare reuses them
+    (no poll), --pick polls again, and every run overwrites the memory."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    @pytest.mark.asyncio
+    async def test_bare_compare_reuses_the_last_models_without_a_poll(self, tmp_path):
+        from agent.model_compare import save_candidates
+        save_candidates(["a:m1", "b:m2"], tmp_path)
+        adapter = _FakeAdapter()
+        runner = _make_runner(adapter)
+        with patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}), \
+                patch.object(runner, "_compare_listing", AsyncMock(return_value=([], "anthropic", "cur"))), \
+                patch("agent.model_compare.run_comparison", _fake_run_comparison):
+            await runner._handle_compare_command(_make_event("/compare why?"))
+            await _drain(runner)
+        assert adapter.clarify_calls == []
+        assert adapter.sent[0].startswith("🔬 Comparing 2 models (last selection): a:m1, b:m2")
+        assert "--pick" in adapter.sent[0]
+        assert sum("answer m" in m for m in adapter.sent) == 2
+
+    @pytest.mark.asyncio
+    async def test_pick_flag_polls_again_and_the_new_pick_is_saved(self, tmp_path):
+        from agent.model_compare import load_saved_candidates, save_candidates
+        from tools import clarify_gateway as cm
+        save_candidates(["a:m1", "b:m2"], tmp_path)
+        adapter = _FakeAdapter()
+        runner = _make_runner(adapter)
+        providers = [{"slug": "openrouter", "models": ["m1", "m2"]}]
+        with patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}), \
+                patch.object(runner, "_compare_listing", AsyncMock(return_value=(providers, "", ""))), \
+                patch("agent.model_compare.run_comparison", _fake_run_comparison):
+            await runner._handle_compare_command(_make_event("/compare --pick why?"))
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if adapter.clarify_calls:
+                    break
+            assert adapter.clarify_calls, "poll was never sent"
+            assert cm.attempt_text_response_for_session("telegram:c1", "2") == cm.TEXT_RESOLVED
+            await _drain(runner)
+        assert adapter.sent[0].startswith("🔬 Comparing 1 models: openrouter:m2")
+        assert load_saved_candidates(tmp_path) == ["openrouter:m2"]
+
+    @pytest.mark.asyncio
+    async def test_pinned_models_are_saved_for_the_next_compare(self, tmp_path):
+        from agent.model_compare import load_saved_candidates
+        adapter = _FakeAdapter()
+        runner = _make_runner(adapter)
+        with patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}), \
+                patch.object(runner, "_compare_listing", AsyncMock(return_value=([], "anthropic", "cur"))), \
+                patch("agent.model_compare.run_comparison", _fake_run_comparison):
+            await runner._handle_compare_command(_make_event("/compare --models a:m1,m2 why?"))
+            await _drain(runner)
+        assert load_saved_candidates(tmp_path) == ["a:m1", "anthropic:m2"]
+
+    @pytest.mark.asyncio
+    async def test_profile_home_scopes_the_memory(self, tmp_path):
+        from agent.model_compare import load_saved_candidates
+        adapter = _FakeAdapter()
+        runner = _make_runner(adapter)
+        runner.config = SimpleNamespace(multiplex_profiles=True)
+        profile = tmp_path / "profiles" / "work"
+        profile.mkdir(parents=True)
+        runner._resolve_profile_home_for_source = lambda source: profile
+        with patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}), \
+                patch.object(runner, "_compare_listing", AsyncMock(return_value=([], "anthropic", "cur"))), \
+                patch("agent.model_compare.run_comparison", _fake_run_comparison), \
+                patch("gateway.run._profile_runtime_scope") as scope:
+            scope.return_value.__enter__ = lambda *_a: None
+            scope.return_value.__exit__ = lambda *_a: False
+            await runner._handle_compare_command(_make_event("/compare --models a:m1 why?"))
+            await _drain(runner)
+        assert load_saved_candidates(profile) == ["a:m1"]
+        assert load_saved_candidates(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_poll_keeps_the_previous_selection(self, tmp_path):
+        from agent.model_compare import load_saved_candidates, save_candidates
+        save_candidates(["a:m1"], tmp_path)
+        adapter = _FakeAdapter()
+        runner = _make_runner(adapter)
+        providers = [{"slug": "openrouter", "models": ["m1", "m2"]}]
+        with patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}), \
+                patch.object(runner, "_compare_listing", AsyncMock(return_value=(providers, "", ""))), \
+                patch("gateway.slash_commands_compare.COMPARE_POLL_TIMEOUT_S", 1):
+            await runner._handle_compare_command(_make_event("/compare --pick hi"))
+            await _drain(runner)
+        assert adapter.sent[-1].startswith("🟡 Comparison cancelled")
+        assert load_saved_candidates(tmp_path) == ["a:m1"]
+
+    def test_usage_mentions_pick(self):
+        runner = _make_runner(_FakeAdapter())
+        assert "--pick" in runner._compare_usage(_make_event("/compare"))
+
+
 @pytest.mark.asyncio
 async def test_listing_offers_only_explicitly_configured_providers(tmp_path):
     """The poll's rows go through ``compare_provider_rows`` (explicit configuration only) with the

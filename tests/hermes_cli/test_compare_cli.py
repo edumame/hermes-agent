@@ -120,7 +120,7 @@ def test_picked_models_run_the_comparison():
     c = _cli()
     seen = {}
 
-    def _pick(rows):
+    def _pick(rows, **_kw):
         seen["rows"] = rows
         return ["anthropic:cur", "openrouter:x"]
 
@@ -222,3 +222,118 @@ def test_picker_with_piped_stdin_cannot_prompt():
         stdin.isatty.return_value = False
         assert c._compare_pick_models(["a:1", "b:2"]) is None
     assert c._compare_pick_models([]) is None
+
+
+# ---------------------------------------------------------------------------
+# Saved selection: the models of the last comparison carry over to the next /compare
+
+
+def _saved(monkeypatch, tmp_path, labels=None):
+    from agent.model_compare import save_candidates
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    if labels:
+        save_candidates(labels, tmp_path)
+
+
+def test_pinned_models_are_remembered_for_the_next_compare(monkeypatch, tmp_path):
+    from agent.model_compare import load_saved_candidates
+    _saved(monkeypatch, tmp_path)
+    _run(_cli(), "/compare --models a:m1,m2 why?")
+    assert load_saved_candidates(tmp_path) == ["a:m1", "anthropic:m2"]
+
+
+def test_picker_starts_with_the_saved_models_checked(monkeypatch, tmp_path):
+    from agent.model_compare import load_saved_candidates
+    _saved(monkeypatch, tmp_path, ["openrouter:x"])
+    c = _cli()
+    seen = {}
+
+    def _pick(rows, *, preselected=None):
+        seen["preselected"] = preselected
+        return ["anthropic:cur", "openrouter:y"]
+
+    with patch.object(c, "_compare_suggestions", return_value=["anthropic:cur", "openrouter:x", "openrouter:y"]), \
+            patch.object(c, "_compare_pick_models", side_effect=_pick):
+        printed, panels = _run(c, "/compare explain monads")
+    assert seen["preselected"] == ["openrouter:x"]
+    assert printed[0].startswith("  🔬 Comparing 2 models: anthropic:cur, openrouter:y")
+    assert load_saved_candidates(tmp_path) == ["anthropic:cur", "openrouter:y"]  # the new pick replaces it
+
+
+def test_saved_models_stand_in_where_nothing_can_prompt(monkeypatch, tmp_path):
+    _saved(monkeypatch, tmp_path, ["a:m1", "b:m2"])
+    c = _cli()
+    with patch.object(c, "_compare_suggestions", return_value=["anthropic:cur"]), \
+            patch.object(c, "_compare_pick_models", return_value=None):
+        printed, panels = _run(c, "/compare explain monads")
+    assert any("Using the last comparison's models: a:m1, b:m2" in line for line in printed)
+    assert [p["header_lines"][0] for p in panels] == ["  🔬 [1/2] a:m1", "  🔬 [2/2] b:m2"]
+
+
+def test_pick_flag_lists_instead_of_reusing_where_nothing_can_prompt(monkeypatch, tmp_path):
+    _saved(monkeypatch, tmp_path, ["a:m1", "b:m2"])
+    c = _cli()
+    with patch.object(c, "_compare_suggestions", return_value=["anthropic:cur", "openrouter:x"]), \
+            patch.object(c, "_compare_pick_models", return_value=None):
+        printed, panels = _run(c, "/compare --pick explain monads")
+    assert panels == []
+    assert any("--models provider:model" in line for line in printed)
+    assert not any("Using the last" in line for line in printed)
+
+
+def test_cancelled_pick_keeps_the_previous_selection(monkeypatch, tmp_path):
+    from agent.model_compare import load_saved_candidates
+    _saved(monkeypatch, tmp_path, ["a:m1"])
+    c = _cli()
+    with patch.object(c, "_compare_suggestions", return_value=["anthropic:cur", "openrouter:x"]), \
+            patch.object(c, "_compare_pick_models", return_value=[]):
+        _run(c, "/compare explain monads")
+    assert load_saved_candidates(tmp_path) == ["a:m1"]
+
+
+def test_picker_under_app_prechecks_saved_rows_case_insensitively():
+    c = _picker_cli()
+    seen = {}
+
+    def _poll(response_queue, deadline_attr):
+        seen["state"] = dict(c._clarify_state)
+        return "openrouter:x"
+
+    c._poll_modal_queue = _poll
+    with patch("cli._cprint"):
+        out = []
+        t = threading.Thread(target=lambda: out.append(c._compare_pick_models(
+            ["anthropic:cur", "openrouter:x", "openrouter:y"], preselected=["OpenRouter:X", "openrouter:y", "gone:z"])))
+        t.start()
+        t.join(5)
+    assert out == [["openrouter:x"]]
+    assert seen["state"]["selected_indices"] == {1, 2}
+    assert seen["state"]["selected"] == 1  # cursor rests on the first checked row
+    assert "pre-checked" in seen["state"]["question"]
+
+
+def test_picker_on_a_plain_tty_reuses_saved_rows_on_a_blank_answer():
+    c = _cli()
+    printed = []
+    prompts = []
+
+    def _ask(prompt):
+        prompts.append(prompt)
+        return "   "
+
+    c._prompt_text_input = _ask
+    with patch("cli._cprint", side_effect=lambda text: printed.append(text)), \
+            patch("sys.stdin") as stdin:
+        stdin.isatty.return_value = True
+        assert c._compare_pick_models(["a:1", "b:2"], preselected=["b:2", "custom:z"]) == ["b:2", "custom:z"]
+    assert any(line.strip() == "2. b:2  (last)" for line in printed)
+    assert any("Last comparison: b:2, custom:z" in line for line in printed)
+    assert "blank reuses the last" in prompts[0]
+
+
+def test_picker_on_a_plain_tty_typed_answer_overrides_saved_rows():
+    c = _cli()
+    c._prompt_text_input = lambda _prompt: "1"
+    with patch("cli._cprint"), patch("sys.stdin") as stdin:
+        stdin.isatty.return_value = True
+        assert c._compare_pick_models(["a:1", "b:2"], preselected=["b:2"]) == ["a:1"]

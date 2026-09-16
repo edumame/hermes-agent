@@ -15,7 +15,8 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -75,22 +76,107 @@ class CompareResult:
 
 
 _MODELS_FLAG_RE = re.compile(r"(?:^|\s)--models?(?:=|\s+)(\S+)")
+# ``--pick`` (alias ``--choose``): open the model picker even when a saved selection exists.
+_PICK_FLAG_RE = re.compile(r"(?:^|\s)--(?:pick|choose)(?=\s|$)")
 
 # Model rows the surfaces suggest/poll: the current route first, then a few per provider.
 SUGGEST_MAX_LABELS = 8
 SUGGEST_MODELS_PER_PROVIDER = 3
 
 
-def parse_compare_args(raw: str) -> tuple[List[str], str]:
-    """``[--models a:b,c:d] <prompt>`` → ``(specs, prompt)``; specs empty without the flag. The
-    flag may sit anywhere in the text; surrounding whitespace collapses."""
+@dataclass(frozen=True)
+class CompareArgs:
+    """Parsed ``/compare`` text: pinned ``--models`` specs, the prompt, and whether ``--pick``
+    asked for the picker despite a saved selection."""
+    specs: List[str]
+    prompt: str
+    pick: bool = False
+
+
+def parse_compare_options(raw: str) -> CompareArgs:
+    """``[--models a:b,c:d] [--pick] <prompt>``. Either flag may sit anywhere in the text;
+    surrounding whitespace collapses."""
     text = str(raw or "").strip()
+    pick = bool(_PICK_FLAG_RE.search(text))
+    if pick:
+        text = " ".join(_PICK_FLAG_RE.sub(" ", text).split())
     match = _MODELS_FLAG_RE.search(text)
     if not match:
-        return [], text
+        return CompareArgs([], text, pick)
     specs = [s.strip() for s in match.group(1).split(",") if s.strip()]
     prompt = " ".join((text[: match.start()] + " " + text[match.end():]).split())
-    return specs, prompt
+    return CompareArgs(specs, prompt, pick)
+
+
+def parse_compare_args(raw: str) -> tuple[List[str], str]:
+    """``[--models a:b,c:d] <prompt>`` → ``(specs, prompt)``; specs empty without the flag.
+    ``--pick`` is stripped; callers that honour it use ``parse_compare_options``."""
+    args = parse_compare_options(raw)
+    return args.specs, args.prompt
+
+
+# ─── Saved selection ─────────────────────────────────────────────────────────
+# The models picked for the last comparison persist per profile so the next ``/compare`` does
+# not start from a blank checklist: the CLI/TUI pickers pre-check them, the gateway (whose poll
+# buttons cannot be pre-toggled) reuses them outright until ``--pick`` or ``--models`` says
+# otherwise. The desktop Compare page keeps its own list in plugin storage.
+COMPARE_SELECTION_FILE = "compare_models.json"
+
+
+def compare_selection_path(home: Union[str, Path, None] = None) -> Path:
+    """``<profile home>/compare_models.json``; ``home`` defaults to the active Hermes home."""
+    if home is None:
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+    return Path(home) / COMPARE_SELECTION_FILE
+
+
+def normalize_candidate_labels(labels: Iterable[Any]) -> List[str]:
+    """``provider:model`` strings (or ``CompareCandidate`` rows) → deduped labels, capped at the
+    fan-out limit. Dedupe is case-insensitive; the first spelling wins."""
+    out: List[str] = []
+    seen: set = set()
+    for item in labels or ():
+        if isinstance(item, CompareCandidate):
+            label = f"{item.provider}:{item.model}" if item.provider else item.model
+        else:
+            label = str(item or "").strip()
+        key = label.lower()
+        if not label or key in seen:
+            continue
+        seen.add(key)
+        out.append(label)
+        if len(out) >= MAX_COMPARE_CANDIDATES:
+            break
+    return out
+
+
+def load_saved_candidates(home: Union[str, Path, None] = None) -> List[str]:
+    """Labels saved by the last comparison, ``[]`` when none were saved or the file is unreadable."""
+    from utils import read_json_or_empty
+    try:
+        data = read_json_or_empty(compare_selection_path(home))
+    except Exception:
+        return []
+    models = data.get("models")
+    return normalize_candidate_labels(models) if isinstance(models, list) else []
+
+
+def save_candidates(labels: Iterable[Any], home: Union[str, Path, None] = None) -> List[str]:
+    """Persist ``labels`` as the selection the next comparison starts from; returns what was
+    stored. An empty selection is not written (a cancelled pick keeps the previous one). Write
+    failures are logged, never raised — remembering models must not break the comparison."""
+    normalized = normalize_candidate_labels(labels)
+    if not normalized:
+        return []
+    try:
+        from utils import atomic_json_write
+        path = compare_selection_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json_write(path, {"models": normalized})
+    except Exception as exc:  # pragma: no cover - disk trouble is not a comparison failure
+        logger.debug("could not save compare model selection: %s", exc)
+    return normalized
 
 
 def suggest_candidate_labels(

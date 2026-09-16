@@ -81,7 +81,7 @@ def _(rid, params: dict) -> dict:
     first, then every model of every provider configured in this profile
     (``hermes_cli.inventory.compare_provider_rows`` + ``agent.model_compare.suggest_candidate_labels``,
     the same rows the CLI checklist shows). ``current`` is the session's ``provider:model``."""
-    from agent.model_compare import suggest_candidate_labels
+    from agent.model_compare import load_saved_candidates, suggest_candidate_labels
     from hermes_cli.inventory import compare_provider_rows
 
     ctx = _model_picker_context(_session_agent(params))
@@ -95,7 +95,25 @@ def _(rid, params: dict) -> dict:
     choices = suggest_candidate_labels(
         providers, current_provider=current_provider, current_model=current_model, limit=None, per_provider=None)
     current = f"{current_provider}:{current_model}" if current_provider and current_model else current_model
-    return _ok(rid, {"choices": choices, "current": current})
+    # The last comparison's models: the overlay pre-checks them so Enter alone repeats the set.
+    selected = load_saved_candidates()
+    return _ok(rid, {"choices": choices, "current": current, "selected": selected})
+
+
+@method("compare.remember")
+@_profile_scoped
+def _(rid, params: dict) -> dict:
+    """Save ``candidates`` (``"provider:model"`` strings or ``{provider, model}`` dicts) as the
+    selection the next ``/compare`` starts from (``agent.model_compare.save_candidates``). The TUI
+    calls it once per comparison — ``compare.run`` is per candidate there, so it cannot know the
+    whole set. Returns the stored labels; an empty list clears nothing (the old selection stays)."""
+    from agent.model_compare import candidates_from_dicts, save_candidates
+
+    raw = params.get("candidates")
+    if isinstance(raw, (str, dict)):
+        raw = [raw]
+    candidates = candidates_from_dicts(raw if isinstance(raw, list) else [])
+    return _ok(rid, {"models": save_candidates(candidates)})
 
 
 def register(server) -> None:

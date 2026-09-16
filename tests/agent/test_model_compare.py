@@ -46,6 +46,51 @@ class TestCandidates:
             ("anthropic", "claude", "Claude"), ("openrouter", "x", "openrouter:x")]
 
 
+class TestArgs:
+    def test_pick_flag_is_lifted_out_anywhere(self):
+        assert mc.parse_compare_options("--pick explain monads") == mc.CompareArgs([], "explain monads", True)
+        assert mc.parse_compare_options("explain --choose monads") == mc.CompareArgs([], "explain monads", True)
+        assert mc.parse_compare_options("--pick --models a:b hi") == mc.CompareArgs(["a:b"], "hi", True)
+        assert mc.parse_compare_options("picky --pickle") == mc.CompareArgs([], "picky --pickle", False)
+
+    def test_tuple_form_strips_pick(self):
+        assert mc.parse_compare_args("--pick --models a:b hi") == (["a:b"], "hi")
+
+
+class TestSavedSelection:
+    def test_roundtrip_dedupes_and_caps(self, tmp_path):
+        assert mc.load_saved_candidates(tmp_path) == []
+        labels = ["a:M", "a:m", " b:x ", ""] + [f"p{i}:m" for i in range(20)]
+        stored = mc.save_candidates(labels, tmp_path)
+        assert stored[:2] == ["a:M", "b:x"] and len(stored) == mc.MAX_COMPARE_CANDIDATES
+        assert mc.load_saved_candidates(tmp_path) == stored
+        assert (tmp_path / mc.COMPARE_SELECTION_FILE).exists()
+
+    def test_candidate_rows_are_saved_as_labels(self, tmp_path):
+        cands = [mc.CompareCandidate("anthropic", "claude", label="Claude"), mc.CompareCandidate("", "bare")]
+        assert mc.save_candidates(cands, tmp_path) == ["anthropic:claude", "bare"]
+
+    def test_empty_selection_keeps_the_previous_one(self, tmp_path):
+        mc.save_candidates(["a:b"], tmp_path)
+        assert mc.save_candidates([], tmp_path) == []
+        assert mc.load_saved_candidates(tmp_path) == ["a:b"]
+
+    def test_corrupt_or_wrong_shape_file_reads_as_empty(self, tmp_path):
+        path = tmp_path / mc.COMPARE_SELECTION_FILE
+        path.write_text("{not json", encoding="utf-8")
+        assert mc.load_saved_candidates(tmp_path) == []
+        path.write_text('{"models": "a:b"}', encoding="utf-8")
+        assert mc.load_saved_candidates(tmp_path) == []
+        path.write_text('{"models": ["a:b", 3, null]}', encoding="utf-8")
+        assert mc.load_saved_candidates(tmp_path) == ["a:b", "3"]
+
+    def test_default_home_is_the_hermes_home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        mc.save_candidates(["a:b"])
+        assert mc.compare_selection_path() == tmp_path / mc.COMPARE_SELECTION_FILE
+        assert mc.load_saved_candidates() == ["a:b"]
+
+
 class TestSuggestions:
     def test_defaults_cap_per_provider_and_total(self):
         from agent.model_compare import SUGGEST_MAX_LABELS, suggest_candidate_labels

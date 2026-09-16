@@ -187,4 +187,42 @@ def test_options_survive_a_failed_listing(server):
     _options_server(server)
     with patch("hermes_cli.inventory.compare_provider_rows", side_effect=RuntimeError("offline")):
         resp = server._methods["compare.options"](7, {})
-    assert resp["result"] == {"choices": ["anthropic:cur"], "current": "anthropic:cur"}
+    assert resp["result"] == {"choices": ["anthropic:cur"], "current": "anthropic:cur", "selected": []}
+
+
+def test_options_carry_the_saved_selection(server, tmp_path, monkeypatch):
+    from agent.model_compare import save_candidates
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    save_candidates(["openrouter:a", "gone:z"], tmp_path)
+    _options_server(server)
+    with patch("hermes_cli.inventory.compare_provider_rows", return_value=[{"slug": "openrouter", "models": ["a"]}]):
+        resp = server._methods["compare.options"](7, {})
+    assert resp["result"]["selected"] == ["openrouter:a", "gone:z"]  # the picker drops rows it cannot show
+
+
+def test_remember_saves_the_selection(server, tmp_path, monkeypatch):
+    from agent.model_compare import load_saved_candidates
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    resp = server._methods["compare.remember"](7, {"candidates": ["a:m1", {"provider": "b", "model": "m2"}, "a:m1"]})
+    assert resp["result"] == {"models": ["a:m1", "b:m2"]}
+    assert load_saved_candidates(tmp_path) == ["a:m1", "b:m2"]
+    # An empty list is not a reset: the previous selection stays.
+    assert server._methods["compare.remember"](8, {"candidates": []})["result"] == {"models": []}
+    assert load_saved_candidates(tmp_path) == ["a:m1", "b:m2"]
+
+
+def test_live_slash_compare_reuses_and_saves_the_selection(tmp_path, monkeypatch):
+    from agent.model_compare import load_saved_candidates, save_candidates
+    from tui_gateway import server
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session = {"agent": types.SimpleNamespace(provider="anthropic", model="cur"), "profile_home": None}
+    with patch("agent.model_compare.run_comparison", _fake_run_comparison):
+        server._live_slash_command_output("sid", session, "compare", "--models a:m1,m2 why?")
+        assert load_saved_candidates(tmp_path) == ["a:m1", "anthropic:m2"]
+        out = server._live_slash_command_output("sid", session, "compare", "again?")
+        assert "[1/2] a:m1" in out and "answer m1 to again?" in out and "[2/2] anthropic:m2" in out
+        # --pick refuses the memory and lists what is available instead.
+        save_candidates(["a:m1"], tmp_path)
+        with patch("hermes_cli.inventory.compare_provider_rows", return_value=[{"slug": "openrouter", "models": ["m1"]}]):
+            out = server._live_slash_command_output("sid", session, "compare", "--pick again?")
+    assert "--models provider:model" in out and "openrouter:m1" in out

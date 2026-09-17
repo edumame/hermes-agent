@@ -352,6 +352,82 @@ def test_anthropic_oauth_presence_accepts_pool_only_oauth_entry():
 # ─── picker_hints ──────────────────────────────────────────────────────
 
 
+def test_compare_provider_rows_offers_only_explicitly_configured_providers():
+    """The /compare pickers must not offer discovery-only rows: an external-process CLI counts as
+    authenticated the moment its binary resolves (a VS Code Copilot shim is enough), so without
+    the explicit filter the checklist offers models that only ever fail."""
+    from hermes_cli.inventory import compare_provider_rows
+
+    rows = [
+        {"slug": "openrouter", "name": "OpenRouter", "models": ["m1", "m2"],
+         "total_models": 2, "is_current": True, "is_user_defined": False, "source": "built-in"},
+        {"slug": "copilot-acp", "name": "GitHub Copilot ACP", "models": ["gpt-5.4"],
+         "total_models": 1, "is_current": False, "is_user_defined": False, "source": "hermes"},
+        {"slug": "moa", "name": "MoA", "models": ["default"],
+         "total_models": 1, "is_current": False, "is_user_defined": False, "source": "virtual"},
+    ]
+    ctx = _empty_ctx(provider="openrouter", model="m1")
+    with (
+        _list_auth_returning(rows) as listing,
+        patch("hermes_cli.config.read_raw_config", return_value={}),
+        patch("hermes_cli.auth.is_provider_explicitly_configured", side_effect=lambda slug: slug == "openrouter"),
+        patch("hermes_cli.inventory._external_process_signed_in", return_value=False),
+    ):
+        out = compare_provider_rows(ctx, max_models=3)
+    assert [row["slug"] for row in out] == ["openrouter"]
+    assert out[0]["authenticated"] is True
+    assert listing.call_args.kwargs["max_models"] == 3
+    assert listing.call_args.kwargs["for_picker"] is True
+
+
+def test_compare_provider_rows_drops_unauthenticated_hint_rows():
+    from hermes_cli.inventory import compare_provider_rows
+
+    payload = {"providers": [
+        {"slug": "openrouter", "models": ["m1"], "authenticated": True},
+        {"slug": "openai", "models": [], "authenticated": False},
+        {"slug": "anthropic", "models": ["a"]},
+    ]}
+    with patch("hermes_cli.inventory.build_models_payload", return_value=payload) as build:
+        out = compare_provider_rows(_empty_ctx(), max_models=2, refresh=True)
+    assert [row["slug"] for row in out] == ["openrouter", "anthropic"]
+    assert build.call_args.kwargs == {
+        "explicit_only": True, "picker_hints": True, "for_picker": True, "max_models": 2, "refresh": True}
+
+
+def test_compare_provider_rows_default_to_every_model():
+    from hermes_cli.inventory import compare_provider_rows
+
+    with (
+        patch("hermes_cli.inventory.build_models_payload", return_value={"providers": []}) as build,
+    ):
+        assert compare_provider_rows(_empty_ctx()) == []
+    assert build.call_args.kwargs["max_models"] is None
+
+
+def _anthropic_rows():
+    return [
+        {"slug": "openrouter", "name": "OpenRouter", "models": ["m1"],
+         "total_models": 1, "is_current": True, "is_user_defined": False, "source": "built-in"},
+        {"slug": "anthropic", "name": "Anthropic", "models": ["claude-opus-5"],
+         "total_models": 1, "is_current": False, "is_user_defined": False, "source": "hermes"},
+    ]
+
+
+def test_compare_provider_rows_keep_anthropic_with_a_claude_code_login():
+    """Same evidence as the desktop picker: a Claude Code login is a usable Anthropic sign-in."""
+    from hermes_cli.inventory import compare_provider_rows
+
+    with (
+        _list_auth_returning(_anthropic_rows()),
+        patch("hermes_cli.config.read_raw_config", return_value={}),
+        patch("hermes_cli.auth.is_provider_explicitly_configured", side_effect=lambda slug: slug == "openrouter"),
+        patch("hermes_cli.inventory._anthropic_oauth_credentials_present", return_value=True),
+    ):
+        out = compare_provider_rows(_empty_ctx(provider="openrouter", model="m1"))
+    assert [row["slug"] for row in out] == ["openrouter", "anthropic"]
+
+
 def test_picker_hints_marks_authed_rows_authenticated():
     rows = [
         {"slug": "openrouter", "name": "OpenRouter", "models": ["m1"],

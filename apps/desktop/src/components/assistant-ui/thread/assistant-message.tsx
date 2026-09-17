@@ -18,6 +18,7 @@ import {
   messageContentText,
   pickPrimaryPreviewTarget
 } from '@/components/assistant-ui/thread/content'
+import { MessageKindSlot } from '@/components/assistant-ui/thread/message-kind-slot'
 import { MESSAGE_PARTS_COMPONENTS } from '@/components/assistant-ui/thread/message-parts'
 import { ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { ResponseLoadingIndicator, TurnActivityIndicator } from '@/components/assistant-ui/thread/status'
@@ -236,7 +237,9 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
             data-slot="aui_assistant-message-content"
           >
             {/* Todos render in the composer status stack now, not inline. */}
-            {MESSAGE_PARTS}
+            {/* A typed persisted turn (display_kind a plugin claims) paints its
+                own body; every other turn paints its parts. */}
+            <MessageKindSlot fallback={MESSAGE_PARTS} />
             <AssistantStatusSlot />
             <AssistantPreviewEmbeds />
             <MessagePrimitive.Error>

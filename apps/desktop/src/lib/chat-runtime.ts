@@ -440,6 +440,8 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
         ...(message.durationS !== undefined ? { durationS: message.durationS } : {}),
         // Structured failure layer for the error card (see lib/error-surface).
         ...(message.errorSurface ? { errorSurface: message.errorSurface } : {}),
+        // A contributed presentation kind (see lib/message-kinds) and its payload.
+        ...(message.displayKind ? { displayKind: message.displayKind, displayMetadata: message.displayMetadata ?? {} } : {}),
         ...reactionMeta
       }
     }

@@ -27,6 +27,7 @@ from gateway.session import AsyncSessionStore
 from gateway.session_transcript import TranscriptReadError
 from gateway.slash_commands_goals import GatewayGoalCommandsMixin
 from gateway.slash_commands_model import GatewayModelCommandsMixin
+from gateway.slash_commands_compare import GatewayCompareCommandsMixin
 from gateway.slash_commands_session import GatewaySessionCommandsMixin
 from gateway.slash_commands_login import GatewayLoginCommandsMixin
 from gateway.slash_commands_status import HISTORY_UNREADABLE, GatewayStatusCommandsMixin
@@ -164,6 +165,7 @@ def _home_thread_from_source(source) -> Optional[str]:
 class GatewaySlashCommandsMixin(
     GatewayLoginCommandsMixin,
     GatewayModelCommandsMixin,
+    GatewayCompareCommandsMixin,
     GatewaySessionCommandsMixin,
     GatewayStatusCommandsMixin,
     GatewayGoalCommandsMixin):

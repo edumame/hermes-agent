@@ -27,6 +27,9 @@ class _ClarifyEntry:
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
+    # Multi-select only: choice indices toggled on by button/poll taps, in tap order. Button
+    # adapters render these as checked rows; "Done" resolves them (see ``resolve_multi_selection``).
+    selected: List[int] = field(default_factory=list)
 
 
 _lock = threading.RLock()
@@ -220,6 +223,79 @@ def attempt_text_response_for_session(session_key: str, response: str) -> str:
 def resolve_text_response_for_session(session_key: str, response: str) -> bool:
     """True only when the typed reply was accepted and the waiter unblocked."""
     return attempt_text_response_for_session(session_key, response) == TEXT_RESOLVED
+
+
+# Label of the synthetic "finish multi-select" row native-poll adapters append (Photon): a native
+# poll has no Done button, so the row IS the button. Button adapters render a real button instead.
+MULTI_SELECT_DONE_LABEL = "\u2705 Done"
+
+
+def is_multi_select(clarify_id: str) -> bool:
+    """True for a pending multi-select entry (button adapters branch on this at render time)."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        return bool(entry is not None and entry.multi_select)
+
+
+def selected_labels(clarify_id: str) -> List[str]:
+    """Choice labels currently toggled on (tap order); empty for unknown/single-select entries."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or not entry.choices:
+            return []
+        return [str(entry.choices[i]).strip() for i in entry.selected if 0 <= i < len(entry.choices)]
+
+
+def toggle_selection(clarify_id: str, index: int) -> Optional[List[int]]:
+    """Flip choice ``index`` on/off for a pending multi-select entry; returns the new selected
+    index list, or None when the entry is unknown, resolved, single-select, or ``index`` is out of
+    range (the adapter then treats the tap as expired / invalid)."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or entry.event.is_set() or not entry.multi_select or not entry.choices:
+            return None
+        if not (0 <= index < len(entry.choices)):
+            return None
+        if index in entry.selected:
+            entry.selected.remove(index)
+        else:
+            entry.selected.append(index)
+        return list(entry.selected)
+
+
+def toggle_selection_by_label(clarify_id: str, label: str, *, selected: Optional[bool] = None) -> Optional[List[int]]:
+    """Label-keyed :func:`toggle_selection` for native polls (a vote carries the option title, not an
+    index). ``selected`` pins the direction (a poll deselection must not re-select); None toggles."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or not entry.choices:
+            return None
+        match = _match_label(str(label), entry.choices)
+        if match is None:
+            return None
+        index = next((i for i, c in enumerate(entry.choices) if str(c).strip() == match), None)
+        if index is None:
+            return None
+        if selected is not None and (index in entry.selected) == selected:
+            return list(entry.selected)  # already in the requested state
+    return toggle_selection(clarify_id, index)
+
+
+def resolve_multi_selection(clarify_id: str) -> Optional[str]:
+    """Resolve a multi-select entry with its toggled labels as the JSON array the clarify tool
+    decodes. Returns the resolved value, ``""`` when nothing is selected yet (entry stays armed so
+    the user can pick first), or None when the entry is unknown/resolved/single-select."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or entry.event.is_set() or not entry.multi_select:
+            return None
+        labels = [str(entry.choices[i]).strip() for i in entry.selected if 0 <= i < len(entry.choices)]
+        if not labels:
+            return ""
+        value = json.dumps(labels, ensure_ascii=False)
+        entry.response = value
+        entry.event.set()
+        return value
 
 
 def mark_awaiting_text(clarify_id: str) -> bool:

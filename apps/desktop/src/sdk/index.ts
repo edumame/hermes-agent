@@ -1422,15 +1422,20 @@ export const host = {
   },
 
   /** Gateway JSON-RPC — sessions, config, skills, cron, kanban, everything
-   *  the app itself uses. Lazy: resolves the LIVE socket per call. */
-  request: async <T>(method: string, params: Record<string, unknown> = {}): Promise<T> => {
+   *  the app itself uses. Lazy: resolves the LIVE socket per call. `timeoutMs`
+   *  opts one call out of the socket's generic 30s deadline: a method that
+   *  legitimately runs long (a model fan-out, a slow listing) must bound its own
+   *  wait, or the socket reports "request timed out" while the backend is still
+   *  working and will succeed. */
+  request: async <T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> => {
     const gateway = $gateway.get()
 
     if (!gateway) {
       throw new Error('Hermes gateway unavailable')
     }
 
-    return gateway.request<T>(method, params)
+    // Omit the bound entirely when unset so the call stays on the socket default.
+    return timeoutMs === undefined ? gateway.request<T>(method, params) : gateway.request<T>(method, params, timeoutMs)
   },
 
   /** The LIVE gateway instance for the active profile (null before the first
@@ -1669,6 +1674,11 @@ export { type BudgetedLoop, type BudgetedLoopOptions, createBudgetedLoop } from 
 /** The blank transcript as a contribution area: claim the sessions you own and
  *  render what stands in the gap. Core's own splash keeps a fresh draft. */
 export { CHAT_EMPTY_AREA, type ChatEmptyContribution, type ChatEmptyProps } from '@/lib/chat-empty'
+/** A typed persisted assistant turn as a contribution area: name the
+ *  `display_kind` you produce and paint its body from the structured
+ *  `display_metadata` (a saved comparison's cards, say) instead of the
+ *  markdown fallback. Core keeps the footer. */
+export { MESSAGE_KINDS_AREA, type MessageKindContribution, type MessageKindProps } from '@/lib/message-kinds'
 /** THE confirm flow for guarded model switches — when a gateway model-switch
  *  RPC answers `confirm_required` (data-policy / expensive-model guard),
  *  route it through this shared applier instead of forking a per-surface

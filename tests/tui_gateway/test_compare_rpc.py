@@ -1,0 +1,460 @@
+"""Tests for the ``compare.run`` JSON-RPC handler (tui_gateway/methods_compare.py).
+
+The handler module is installed onto a stand-in server namespace (the same ``bind_module``
+seam server.py uses), so the tests exercise argument validation and the result shape without
+importing the whole server. The comparison itself is stubbed.
+"""
+
+from __future__ import annotations
+
+import logging
+import types
+from unittest.mock import patch
+
+import pytest
+
+from agent.model_compare import CompareResult
+
+
+def _ok(rid, result):
+    return {"jsonrpc": "2.0", "id": rid, "result": result}
+
+
+def _err(rid, code, msg, data=None):
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}
+
+
+def _int_param(params, key, default):
+    try:
+        return int(params.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+@pytest.fixture()
+def server():
+    fake = types.ModuleType("fake_server")
+    fake._ok, fake._err, fake._int_param = _ok, _err, _int_param
+    fake._sessions = {}
+    fake._methods = {}
+    fake.logger = logging.getLogger("fake_server")
+    fake._profile_scoped = lambda handler: handler
+    from tui_gateway import methods_compare
+    methods_compare.register(fake)
+    return fake
+
+
+def _call(server, **params):
+    return server._methods["compare.run"](7, params)
+
+
+def test_registered_and_long_running():
+    from tui_gateway import server as real
+    assert "compare.run" in real._LONG_HANDLERS
+    assert "compare.options" in real._LONG_HANDLERS
+    assert "compare.options" in real._methods
+    assert "compare.run" in real._methods
+
+
+def test_prompt_required(server):
+    resp = _call(server, candidates=[{"provider": "p", "model": "m"}])
+    assert resp["error"]["code"] == 4040
+
+
+def test_candidates_required(server):
+    resp = _call(server, prompt="hi", candidates=[{"model": ""}])
+    assert resp["error"]["code"] == 4041
+    assert "candidates required" in resp["error"]["message"]
+
+
+def test_runs_and_returns_result_dicts(server):
+    captured = {}
+
+    def fake_run(candidates, prompt, **kw):
+        captured["candidates"] = candidates
+        captured["kw"] = kw
+        return [CompareResult(c.provider, c.model, c.display, text=f"{c.model}!", elapsed_s=0.5) for c in candidates]
+
+    with patch("agent.model_compare.run_comparison", fake_run):
+        resp = _call(
+            server, prompt="q", candidates=[{"provider": "a", "model": "m1"}, "b:m2"],
+            max_tokens=999999, temperature="0.7", timeout=1, system="be terse")
+    results = resp["result"]["results"]
+    assert [(r["label"], r["text"], r["ok"]) for r in results] == [("a:m1", "m1!", True), ("b:m2", "m2!", True)]
+    assert resp["result"]["prompt"] == "q"
+    assert captured["kw"]["max_tokens"] == 16384  # capped
+    assert captured["kw"]["temperature"] == 0.7
+    assert captured["kw"]["timeout"] == 5.0  # floor
+    assert captured["kw"]["system_prompt"] == "be terse"
+    assert captured["kw"]["history"] is None
+
+
+def test_single_string_candidate_and_history_from_live_session(server):
+    server._sessions["sid"] = {"history": [{"role": "user", "content": "earlier"}], "agent": None}
+    captured = {}
+
+    def fake_run(candidates, prompt, **kw):
+        captured.update(kw)
+        return []
+
+    with patch("agent.model_compare.run_comparison", fake_run):
+        resp = _call(server, prompt="q", candidates="p:m", session_id="sid", include_history=True)
+    assert resp["result"]["results"] == []
+    assert captured["history"] == [{"role": "user", "content": "earlier"}]
+
+
+def test_failure_is_an_rpc_error(server):
+    with patch("agent.model_compare.run_comparison", side_effect=RuntimeError("boom")):
+        resp = _call(server, prompt="q", candidates=[{"provider": "p", "model": "m"}])
+    assert resp["error"]["code"] == 5040 and "boom" in resp["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# TUI / desktop typed `/compare`: answered from the live server, not the slash worker
+
+
+def _fake_run_comparison(candidates, prompt, **_kw):
+    return [CompareResult(c.provider, c.model, c.display, text=f"answer {c.model} to {prompt}", elapsed_s=1.0)
+            for c in candidates]
+
+
+def test_live_slash_compare_answers_without_the_worker():
+    from tui_gateway import server
+    session = {"agent": types.SimpleNamespace(provider="anthropic", model="cur"), "profile_home": None}
+    with patch("agent.model_compare.run_comparison", _fake_run_comparison):
+        out = server._live_slash_command_output("sid", session, "compare", "--models a:m1,m2 why?")
+    assert out is not None
+    assert "[1/2] a:m1" in out and "answer m1 to why?" in out
+    assert "[2/2] anthropic:m2" in out  # bare name takes the live agent's provider
+    assert "Comparison summary" in out
+
+
+def test_live_slash_compare_without_session_or_models():
+    from tui_gateway import server
+    assert "Usage: /compare" in server._live_slash_command_output("sid", None, "compare", "")
+    rows = [{"slug": "openrouter", "models": ["m1"]}]
+    with patch("hermes_cli.inventory.compare_provider_rows", return_value=rows):
+        out = server._live_slash_command_output("sid", None, "compare", "just a prompt")
+    assert "--models provider:model" in out and "openrouter:m1" in out
+
+
+def _options_server(server, provider="anthropic", model="cur"):
+    server._session_agent = lambda params: None
+    server._model_picker_context = lambda agent: types.SimpleNamespace(
+        current_provider=provider, current_model=model, current_base_url="")
+    return server
+
+
+def test_options_list_current_route_then_configured_providers(server):
+    _options_server(server)
+    rows = [
+        {"slug": "moa", "models": ["preset"]},
+        {"slug": "openrouter", "models": ["a", "b", "c", "d"], "authenticated": True},
+        {"slug": "anthropic", "models": ["cur", "next"]},
+    ]
+    with patch("hermes_cli.inventory.compare_provider_rows", return_value=rows) as listing:
+        resp = server._methods["compare.options"](7, {"session_id": "s1", "refresh": True})
+    assert resp["result"]["current"] == "anthropic:cur"
+    assert resp["result"]["choices"] == [
+        "anthropic:cur", "openrouter:a", "openrouter:b", "openrouter:c", "openrouter:d", "anthropic:next"]
+    assert listing.call_args.kwargs == {"refresh": True}  # no per-provider cap: the overlay scrolls
+
+
+def test_options_list_every_model(server):
+    _options_server(server)
+    rows = [{"slug": "openrouter", "models": [f"m{i}" for i in range(30)]}]
+    with patch("hermes_cli.inventory.compare_provider_rows", return_value=rows):
+        resp = server._methods["compare.options"](7, {})
+    assert len(resp["result"]["choices"]) == 31
+
+
+def test_options_only_offer_explicitly_configured_providers(server):
+    """A resolvable ``copilot`` binary makes copilot-acp "authenticated" for discovery, but the
+    picker must not offer it unless the user configured it — the rows go through the explicit filter."""
+    _options_server(server)
+    payload = {"providers": [
+        {"slug": "openrouter", "models": ["a"], "authenticated": True},
+        {"slug": "openai", "models": [], "authenticated": False},
+    ]}
+    with patch("hermes_cli.inventory.build_models_payload", return_value=payload) as build:
+        resp = server._methods["compare.options"](7, {})
+    assert resp["result"]["choices"] == ["anthropic:cur", "openrouter:a"]
+    assert build.call_args.kwargs["explicit_only"] is True
+    assert build.call_args.kwargs["max_models"] is None
+
+
+def test_options_survive_a_failed_listing(server):
+    _options_server(server)
+    with patch("hermes_cli.inventory.compare_provider_rows", side_effect=RuntimeError("offline")):
+        resp = server._methods["compare.options"](7, {})
+    assert resp["result"] == {"choices": ["anthropic:cur"], "current": "anthropic:cur", "selected": []}
+
+
+def test_options_carry_the_saved_selection(server, tmp_path, monkeypatch):
+    from agent.model_compare import save_candidates
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    save_candidates(["openrouter:a", "gone:z"], tmp_path)
+    _options_server(server)
+    with patch("hermes_cli.inventory.compare_provider_rows", return_value=[{"slug": "openrouter", "models": ["a"]}]):
+        resp = server._methods["compare.options"](7, {})
+    assert resp["result"]["selected"] == ["openrouter:a", "gone:z"]  # the picker drops rows it cannot show
+
+
+def test_remember_saves_the_selection(server, tmp_path, monkeypatch):
+    from agent.model_compare import load_saved_candidates
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    resp = server._methods["compare.remember"](7, {"candidates": ["a:m1", {"provider": "b", "model": "m2"}, "a:m1"]})
+    assert resp["result"] == {"models": ["a:m1", "b:m2"]}
+    assert load_saved_candidates(tmp_path) == ["a:m1", "b:m2"]
+    # An empty list is not a reset: the previous selection stays.
+    assert server._methods["compare.remember"](8, {"candidates": []})["result"] == {"models": []}
+    assert load_saved_candidates(tmp_path) == ["a:m1", "b:m2"]
+
+
+def test_live_slash_compare_reuses_and_saves_the_selection(tmp_path, monkeypatch):
+    from agent.model_compare import load_saved_candidates, save_candidates
+    from tui_gateway import server
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session = {"agent": types.SimpleNamespace(provider="anthropic", model="cur"), "profile_home": None}
+    with patch("agent.model_compare.run_comparison", _fake_run_comparison):
+        server._live_slash_command_output("sid", session, "compare", "--models a:m1,m2 why?")
+        assert load_saved_candidates(tmp_path) == ["a:m1", "anthropic:m2"]
+        out = server._live_slash_command_output("sid", session, "compare", "again?")
+        assert "[1/2] a:m1" in out and "answer m1 to again?" in out and "[2/2] anthropic:m2" in out
+        # --pick refuses the memory and lists what is available instead.
+        save_candidates(["a:m1"], tmp_path)
+        with patch("hermes_cli.inventory.compare_provider_rows", return_value=[{"slug": "openrouter", "models": ["m1"]}]):
+            out = server._live_slash_command_output("sid", session, "compare", "--pick again?")
+    assert "--models provider:model" in out and "openrouter:m1" in out
+
+
+def test_selection_is_one_list_for_every_surface(server, tmp_path, monkeypatch):
+    from agent.model_compare import load_saved_candidates, save_candidates
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    selection = server._methods["compare.selection"]
+    assert selection(1, {})["result"] == {"models": []}
+
+    save_candidates(["a:m1"], tmp_path)  # what the TUI picker / messaging /compare remembered
+    assert selection(2, {})["result"] == {"models": ["a:m1"]}
+
+    # The desktop replaces it — strings or dicts, deduped, and the TUI sees the new set.
+    resp = selection(3, {"models": [{"provider": "b", "model": "m2"}, "c:m3", "C:M3"]})
+    assert resp["result"] == {"models": ["b:m2", "c:m3"]}
+    assert load_saved_candidates(tmp_path) == ["b:m2", "c:m3"]
+
+    # Removing the last model sticks (compare.remember would keep the old set).
+    assert selection(4, {"models": []})["result"] == {"models": []}
+    assert load_saved_candidates(tmp_path) == []
+    assert server._methods["compare.remember"](5, {"candidates": []})["result"] == {"models": []}
+
+
+# ── compare.save: a finished comparison persisted as a chat ─────────────────────────────
+
+
+def _save_server(server, tmp_path):
+    """Give the stand-in server the store plumbing compare.save binds: a real SessionDB in tmp_path."""
+    import contextlib
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+
+    @contextlib.contextmanager
+    def _profile_db(params=None):
+        yield db
+
+    server._profile_db = _profile_db
+    server._new_session_key = lambda: f"sess-{len(db.list_sessions_rich(limit=100)) + 1:04d}"
+    server._resolve_session_platform = lambda: "desktop"
+    server._response_profile_name = lambda profile=None: profile or "default"
+    from tui_gateway import methods_compare
+    methods_compare.register(server)
+    return db
+
+
+def _rows():
+    return [
+        {"provider": "a", "model": "m1", "label": "a:m1", "text": "one", "ok": True, "elapsed_s": 1.2,
+         "input_tokens": 3, "output_tokens": 4, "cost_usd": 0.001},
+        {"provider": "b", "model": "m2", "label": "b:m2", "text": "", "ok": False, "error": "rate limited",
+         "elapsed_s": 0.4, "input_tokens": 0, "output_tokens": 0},
+    ]
+
+
+def test_save_registered():
+    from tui_gateway import server as real
+    assert "compare.save" in real._methods
+
+
+def test_save_persists_a_titled_chat(server, tmp_path):
+    db = _save_server(server, tmp_path)
+    resp = server._methods["compare.save"](7, {"prompt": "  why is the sky blue?  ", "results": _rows()})
+    key = resp["result"]["stored_session_id"]
+    assert resp["result"] == {"stored_session_id": key, "title": "Compare: why is the sky blue?", "message_count": 2}
+
+    row = db.get_session(key)
+    assert row["source"] == "desktop" and row["profile_name"] == "default"
+    assert db.get_session_title(key) == "Compare: why is the sky blue?"
+    assert db.get_session_title_source(key) == db.TITLE_SOURCE_USER  # auto-titling never renames it
+
+    messages = db.get_messages(key)
+    assert [m["role"] for m in messages] == ["user", "assistant"]
+    assert messages[0]["content"] == "why is the sky blue?"
+    answer = messages[1]["content"]
+    assert "[1/2] a:m1" in answer and "one" in answer and "1.2s · 3→4 tokens · $0.0010" in answer
+    assert "[2/2] b:m2" in answer and "Failed: rate limited" in answer
+    assert "Comparison summary" in answer
+    # The sidebar lists it like any other chat.
+    assert [s["id"] for s in db.list_sessions_rich(limit=10)] == [key]
+
+
+def test_save_keeps_both_chats_when_the_prompt_repeats(server, tmp_path):
+    _save_server(server, tmp_path)
+    first = server._methods["compare.save"](7, {"prompt": "q", "results": _rows()})["result"]
+    second = server._methods["compare.save"](8, {"prompt": "q", "results": _rows()})["result"]
+    assert first["title"] == "Compare: q"
+    assert second["title"].startswith("Compare: q (") and second["stored_session_id"] != first["stored_session_id"]
+
+
+def test_save_honours_an_explicit_title_and_validates(server, tmp_path):
+    db = _save_server(server, tmp_path)
+    resp = server._methods["compare.save"](7, {"prompt": "q", "results": _rows(), "title": "  Sky test  "})
+    assert db.get_session_title(resp["result"]["stored_session_id"]) == "Sky test"
+
+    assert server._methods["compare.save"](8, {"results": _rows()})["error"]["code"] == 4040
+    assert server._methods["compare.save"](9, {"prompt": "q", "results": []})["error"]["code"] == 4042
+    assert server._methods["compare.save"](10, {"prompt": "q", "results": [{"text": "no model"}]})["error"]["code"] == 4042
+
+
+def test_save_reports_a_missing_store(server, tmp_path):
+    import contextlib
+
+    _save_server(server, tmp_path)
+
+    @contextlib.contextmanager
+    def _no_db(params=None):
+        yield None
+
+    server._profile_db = _no_db
+    from tui_gateway import methods_compare
+    methods_compare.register(server)
+    resp = server._methods["compare.save"](7, {"prompt": "q", "results": _rows()})
+    assert resp["error"]["code"] == 5041
+
+
+# ── The reply must survive the websocket encoder ─────────────────────────────────────────
+
+
+def _dispatch_and_collect(server_mod, req, write, *, expect_frames: int = 1):
+    import threading
+    import types
+
+    replied = threading.Event()
+    frames = []
+
+    def _write(frame):
+        frames.append(frame)
+        try:
+            return write(frame)
+        finally:
+            if sum(1 for f in frames if f.get("id") == req["id"]) >= expect_frames:
+                replied.set()
+
+    assert server_mod.dispatch(req, types.SimpleNamespace(write=_write)) is None  # pooled, not inline
+    assert replied.wait(10), "no reply reached the transport"
+    return frames
+
+
+def test_compare_run_reply_is_json_encodable_over_the_pool():
+    """The desktop hung forever on every comparison: usage pricing hands back a Decimal cost, the
+    websocket transport's json.dumps raised on it AFTER the handler returned, and the pool swallowed
+    the exception — no reply, no log. The wire shape must encode with the plain encoder."""
+    import json
+    from decimal import Decimal
+
+    from tui_gateway import server as real
+
+    def fake_run(candidates, prompt, **kw):
+        return [CompareResult(c.provider, c.model, c.display, text="pong", elapsed_s=1.2, cost_usd=Decimal("0.0021"))
+                for c in candidates]
+
+    req = {"jsonrpc": "2.0", "id": 41, "method": "compare.run",
+           "params": {"prompt": "q", "candidates": [{"provider": "p", "model": "m"}]}}
+    with patch("agent.model_compare.run_comparison", fake_run):
+        frames = _dispatch_and_collect(real, req, lambda frame: json.dumps(frame, ensure_ascii=False))
+    reply = next(f for f in frames if f.get("id") == 41)
+    assert reply["result"]["results"][0]["cost_usd"] == 0.0021
+
+
+def test_pool_write_failure_becomes_an_error_reply():
+    """Belt and braces for the same class of bug in any long handler: a transport write that raises
+    is reported as the request's error instead of vanishing inside the pool."""
+    from tui_gateway import server as real
+
+    def fake_run(candidates, prompt, **kw):
+        return [CompareResult(c.provider, c.model, c.display, text="pong") for c in candidates]
+
+    def write(frame):
+        if "result" in frame:
+            raise TypeError("Object of type Weird is not JSON serializable")
+        return True
+
+    req = {"jsonrpc": "2.0", "id": 42, "method": "compare.run",
+           "params": {"prompt": "q", "candidates": [{"provider": "p", "model": "m"}]}}
+    with patch("agent.model_compare.run_comparison", fake_run):
+        frames = _dispatch_and_collect(real, req, write, expect_frames=2)
+    assert [("result" in f, "error" in f) for f in frames if f.get("id") == 42] == [(True, False), (False, True)]
+    assert "response write failed" in frames[-1]["error"]["message"]
+
+
+# ── The saved turn is typed for a card renderer; compare.branch pins a child to one model ──
+
+
+def test_saved_turn_carries_the_structured_rows(server, tmp_path):
+    db = _save_server(server, tmp_path)
+    key = server._methods["compare.save"](7, {"prompt": "q", "results": _rows()})["result"]["stored_session_id"]
+    user, answer = db.get_messages(key)
+    assert "display_kind" not in user or not user.get("display_kind")
+    assert answer["display_kind"] == "compare"
+    meta = answer["display_metadata"]
+    assert meta["kind"] == "compare" and meta["prompt"] == "q"
+    assert [(r["label"], r["ok"]) for r in meta["results"]] == [("a:m1", True), ("b:m2", False)]
+    # The wire projection a resuming desktop reads keeps both.
+    from tui_gateway import server as real
+    projected = real._history_to_messages(db.get_messages(key))
+    assert projected[1]["display_kind"] == "compare" and projected[1]["display_metadata"]["results"][0]["text"] == "one"
+
+
+def test_branch_pins_a_child_chat_to_the_chosen_model(server, tmp_path):
+    db = _save_server(server, tmp_path)
+    parent = server._methods["compare.save"](7, {"prompt": "why is the sky blue?", "results": _rows()})["result"]
+    # A real, routable provider: resume drops a provider it cannot route (the fake "a" of _rows()).
+    chosen = {**_rows()[0], "provider": "openrouter", "model": "anthropic/claude-sonnet-5",
+              "label": "openrouter:anthropic/claude-sonnet-5"}
+    resp = server._methods["compare.branch"](8, {"session_id": parent["stored_session_id"], "prompt": "why is the sky blue?",
+                                                 "result": chosen})
+    child = resp["result"]
+    assert child["model"] == "anthropic/claude-sonnet-5" and child["provider"] == "openrouter"
+    assert child["parent_session_id"] == parent["stored_session_id"]
+    assert child["title"] == "anthropic/claude-sonnet-5 · why is the sky blue?"
+
+    row = db.get_session(child["stored_session_id"])
+    assert row["parent_session_id"] == parent["stored_session_id"] and row["model"] == "anthropic/claude-sonnet-5"
+    import json
+    config = json.loads(row["model_config"]) if isinstance(row["model_config"], str) else row["model_config"]
+    assert config["provider"] == "openrouter" and config["_branched_from"] == parent["stored_session_id"]
+    assert [(m["role"], m["content"]) for m in db.get_messages(child["stored_session_id"])] == [
+        ("user", "why is the sky blue?"), ("assistant", "one")]
+    # The resume path restores exactly that model + provider.
+    from tui_gateway import server as real
+    overrides = real._stored_session_runtime_overrides(row)
+    assert overrides["model_override"]["model"] == "anthropic/claude-sonnet-5"
+    assert overrides["model_override"]["provider"] == "openrouter"
+
+
+def test_branch_validates_its_inputs(server, tmp_path):
+    _save_server(server, tmp_path)
+    branch = server._methods["compare.branch"]
+    assert branch(1, {"prompt": "q", "result": _rows()[0]})["error"]["code"] == 4040
+    assert branch(2, {"session_id": "nope", "result": _rows()[0]})["error"]["code"] == 4040
+    assert branch(3, {"session_id": "nope", "prompt": "q", "result": _rows()[1]})["error"]["code"] == 4043  # failed row
+    assert branch(4, {"session_id": "nope", "prompt": "q", "result": _rows()[0]})["error"]["code"] == 4001

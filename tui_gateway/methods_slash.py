@@ -7,6 +7,7 @@ method_ctx.bind_module), so they reference server.py globals bare.
 from __future__ import annotations
 
 import contextlib
+from typing import Optional
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -187,6 +188,52 @@ def _format_live_model_output(session: dict) -> str:
     return f"Current model: {model}" + (f" ({provider})" if provider else "")
 
 
+# Fits inside the TUI/desktop slash.exec request timeout (120s) with headroom for the summary.
+_COMPARE_LIVE_TIMEOUT_S = 100.0
+
+
+def _format_live_compare_output(sid: str, session: Optional[dict], arg: str) -> str:
+    """``/compare [--models a:b,c:d] <prompt>`` answered here, not in the slash worker: the fan-out
+    can outlive the worker's 45s cap, and the worker only returns output after the whole command
+    (#99065). Runs under the session's profile scope; the live agent's route is the default provider."""
+    from agent.model_compare import (
+        SUGGEST_MODELS_PER_PROVIDER, format_comparison_text, load_saved_candidates, parse_candidate_list,
+        parse_compare_options, run_comparison, save_candidates, suggest_candidate_labels,
+    )
+    args = parse_compare_options(arg)
+    specs, prompt = list(args.specs), args.prompt
+    if not prompt:
+        return ("Usage: /compare [--models provider:model,provider:model] [--pick] <prompt>\n"
+                "Sends the prompt to every listed model and prints each answer separately. Without --models "
+                "the last comparison's models are reused; --pick lists the available models instead.")
+    agent = (session or {}).get("agent")
+    provider = str(getattr(agent, "provider", "") or "") if agent is not None else ""
+    model = str(getattr(agent, "model", "") or "") if agent is not None else ""
+    scope = _session_profile_runtime_scope(session) if session is not None else contextlib.nullcontext()
+    with scope:
+        if not specs and not args.pick:
+            specs = load_saved_candidates()  # the last comparison's models stand in for a bare prompt
+        if not specs:
+            try:  # explicitly configured providers only — same rows as the pickers
+                from hermes_cli.inventory import compare_provider_rows
+                providers = compare_provider_rows(
+                    _model_picker_context(agent), max_models=SUGGEST_MODELS_PER_PROVIDER)
+            except Exception:
+                providers = []
+            rows = suggest_candidate_labels(providers, current_provider=provider, current_model=model)
+            lines = ["/compare needs the models to compare: --models provider:model,provider:model"]
+            if rows:
+                lines.append("Available (pass any of these, comma-separated):")
+                lines.extend(f"  {row}" for row in rows)
+            return "\n".join(lines)
+        candidates = parse_candidate_list(specs, default_provider=provider)
+        if not candidates:
+            return "No valid models in --models."
+        save_candidates(candidates)
+        results = run_comparison(candidates, prompt, timeout=_COMPARE_LIVE_TIMEOUT_S)
+    return format_comparison_text(results)
+
+
 def _format_live_status_output(sid: str, session: dict, arg: str) -> str:
     response = _methods["session.status"]("status", {"session_id": sid})
     if response.get("error"):
@@ -197,6 +244,7 @@ def _format_live_status_output(sid: str, session: dict, arg: str) -> str:
 # name → (reply when there is no session, formatter(sid, session, arg) or a fixed reply).
 # A None no-session reply means the formatter handles a missing session itself.
 _LIVE_SLASH_OUTPUT = {
+    "compare": (None, _format_live_compare_output),
     "compress": ("no active session for /compress",
                  lambda sid, session, arg: _mirror_slash_side_effects(sid, session, f"/compress {arg}".strip())),
     "usage": (_NO_AGENT_USAGE, _format_live_usage_output),

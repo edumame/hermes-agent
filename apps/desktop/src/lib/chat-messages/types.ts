@@ -44,6 +44,11 @@ export type ChatMessage = {
   rowId?: number
   /** Emoji reactions on this message — one per author (see MessageReaction). */
   reactions?: MessageReaction[]
+  /** A persisted assistant turn's presentation kind when a contributed
+   *  renderer may claim it (`lib/message-kinds`), with its parsed
+   *  `display_metadata`. Timeline kinds core paints itself never set this. */
+  displayKind?: string
+  displayMetadata?: Record<string, unknown>
 }
 
 export type GatewayEventPayload = {

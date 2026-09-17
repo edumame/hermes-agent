@@ -164,7 +164,7 @@ _LONG_HANDLERS = frozenset({
     "session.foreign.list", "session.foreign.preview", "session.foreign.import",
     "billing.state", "subscription.state", "subscription.preview", "subscription.change",
     "subscription.resume", "subscription.upgrade", "usage.bars", "session.usage", "billing.step_up",
-    "browser.manage", "cli.exec", "complete.path", "complete.slash", "llm.oneshot", "model.options",
+    "browser.manage", "cli.exec", "compare.options", "compare.run", "complete.path", "complete.slash", "llm.oneshot", "model.options",
     "pet.cells", "pet.gallery", "pet.generate", "pet.hatch", "pet.info", "pet.select", "pet.thumb",
     "learning.frames", "plugins.manage", "reload.mcp", "mcp.servers.test", "mcp.servers.oauth.start",
     "process.list", "profiles.configure", "profiles.create", "profiles.describe", "profiles.get_asset",
@@ -805,8 +805,17 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
                 resp = handle_request(req)
             except Exception as exc:
                 resp = _err(req.get("id"), -32000, f"handler error: {exc}")
-            if resp is not None:
+            if resp is None:
+                return
+            # A write that raises (a result the transport cannot serialize, say) used to escape here
+            # and die inside the pool: no reply, no log, and the client waited out its timeout. Report
+            # it as the request's error instead — an error envelope is always serializable.
+            try:
                 t.write(resp)
+            except Exception as exc:
+                logger.exception("rpc response write failed method=%s id=%s", normalized[1], req.get("id"))
+                with contextlib.suppress(Exception):
+                    t.write(_err(req.get("id"), -32000, f"response write failed: {exc}"))
         _pool.submit(lambda: ctx.run(run))
         return None
     finally:
@@ -3246,7 +3255,7 @@ from . import (  # noqa: E402
     methods_projects as _methods_projects, methods_session_foreign as _methods_session_foreign,
     methods_session_control as _methods_session_control, methods_subagents as _methods_subagents,
     methods_vault as _methods_vault, methods_free_tier as _methods_free_tier,
-    methods_connectors as _methods_connectors)
+    methods_connectors as _methods_connectors, methods_compare as _methods_compare)
 
 for _m in (
     _session_transports, _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
@@ -3256,6 +3265,7 @@ for _m in (
     _methods_browser_control, _methods_session, _methods_prompt, _methods_config,
     _methods_config_set, _methods_complete, _methods_tools, _methods_profiles, _methods_images,
     _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects, _methods_session_foreign,
-    _methods_session_control, _methods_subagents, _methods_vault, _methods_free_tier, _methods_connectors):
+    _methods_session_control, _methods_subagents, _methods_vault, _methods_free_tier, _methods_connectors,
+    _methods_compare):
     _m.register(sys.modules[__name__])
 del _m

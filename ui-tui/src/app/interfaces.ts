@@ -281,12 +281,19 @@ export interface SubscriptionOverlayState {
   stepUpRetry?: null | SubscriptionStepUpRetry
 }
 
+/** Pending `/compare <prompt>` pick: the checklist hands the chosen `provider:model` labels back. */
+export interface ComparePickerReq {
+  onPick: (labels: string[]) => void
+  prompt: string
+}
+
 export interface OverlayState {
   agents: boolean
   agentsInitialHistoryIndex: number
   approval: ApprovalReq | null
   billing: BillingOverlayState | null
   clarify: ClarifyReq | null
+  comparePicker: ComparePickerReq | null
   confirm: ConfirmReq | null
   /** Ambient widget apps — glanceable dock, non-blocking (never in $isBlocked). */
   ambient: ActiveWidget[]

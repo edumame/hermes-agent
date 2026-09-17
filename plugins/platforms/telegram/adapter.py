@@ -3878,13 +3878,39 @@ class TelegramAdapter(BasePlatformAdapter):
             if choices:
                 # Full option text in the body (mobile truncates button labels); buttons keep numeric labels.
                 text += "\n\n" + "\n".join(f"{i + 1}. {_html.escape(str(c))}" for i, c in enumerate(choices))
-                # Telegram caps callback_data at 64 bytes; keep "cl:<id>:<idx>" short.
-                rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
-                rows.append([InlineKeyboardButton("✏️ Other (type answer)", callback_data=f"cl:{clarify_id}:other")])
-                keyboard = InlineKeyboardMarkup(rows)
+                if self._clarify_is_multi(clarify_id):
+                    text += "\n\n<i>Select one or more, then tap ✅ Done.</i>"
+                keyboard = self._clarify_keyboard(
+                    clarify_id, len(choices), selected=[] if self._clarify_is_multi(clarify_id) else None)
             return text, keyboard, lambda msg: self._clarify_state.__setitem__(clarify_id, session_key)
         return await self._send_prompt(
             "send_clarify", chat_id, metadata, build, parse_mode=ParseMode.HTML, thread_id=self._metadata_thread_id(metadata))
+
+    @staticmethod
+    def _clarify_is_multi(clarify_id: str) -> bool:
+        try:
+            from tools.clarify_gateway import is_multi_select
+            return is_multi_select(clarify_id)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _clarify_keyboard(clarify_id: str, count: int, selected: Optional[List[int]] = None) -> "InlineKeyboardMarkup":
+        """Numeric rows + Other; a multi-select prompt renders checkbox rows (``☐ 1`` / ``☑ 1``) that
+        toggle in place plus a ``✅ Done`` row that resolves. Telegram caps callback_data at 64 bytes;
+        keep ``cl:<id>:<idx|done|other>`` short."""
+        multi = selected is not None
+        chosen = set(selected or ())
+        rows = []
+        for idx in range(count):
+            label = str(idx + 1)
+            if multi:
+                label = f"{'☑' if idx in chosen else '☐'} {label}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"cl:{clarify_id}:{idx}")])
+        if multi:
+            rows.append([InlineKeyboardButton("✅ Done", callback_data=f"cl:{clarify_id}:done")])
+        rows.append([InlineKeyboardButton("✏️ Other (type answer)", callback_data=f"cl:{clarify_id}:other")])
+        return InlineKeyboardMarkup(rows)
 
     @staticmethod
     def _provider_get_label():
@@ -4426,6 +4452,9 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._edit_html_quiet(
                 query, f"❓ {query.message.text or ''}\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>")
             return
+        if choice_token == "done" or self._clarify_is_multi(clarify_id):
+            await self._handle_multi_select_clarify_callback(query, clarify_id, choice_token, user_display)
+            return
         # Numeric choice → resolve immediately with the chosen text
         try:
             idx = int(choice_token)
@@ -4459,6 +4488,45 @@ class TelegramAdapter(BasePlatformAdapter):
             # Entry evicted / gateway restarted between ask and tap.
             await self._notify_clarify_expired(query, user_display)
             logger.warning("Telegram clarify button: resolve_gateway_clarify returned False (id=%s)", clarify_id)
+
+    async def _handle_multi_select_clarify_callback(self, query, clarify_id: str, choice_token: str, user_display: str) -> None:
+        """Multi-select rows toggle (keyboard re-rendered with the check state); ``done`` resolves the
+        entry with every toggled label (nothing toggled → nudge, entry stays armed)."""
+        from tools import clarify_gateway as _cg
+        if choice_token == "done":
+            value = _cg.resolve_multi_selection(clarify_id)
+            if value is None:
+                self._clarify_state.pop(clarify_id, None)
+                await self._notify_clarify_expired(query, user_display)
+                return
+            if value == "":
+                await query.answer(text="Select at least one option first.")
+                return
+            self._clarify_state.pop(clarify_id, None)
+            labels = ", ".join(_cg.selected_labels(clarify_id) or json.loads(value))
+            await query.answer(text=f"✓ {labels[:60]}")
+            await self._edit_html_quiet(
+                query, f"❓ {_html.escape(query.message.text or '')}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(labels)}")
+            logger.info("Telegram multi-select clarify resolved (id=%s, count=%d, user=%s)",
+                        clarify_id, len(json.loads(value)), user_display)
+            return
+        try:
+            idx = int(choice_token)
+        except (ValueError, TypeError):
+            await query.answer(text="Invalid choice.")
+            return
+        selected = _cg.toggle_selection(clarify_id, idx)
+        if selected is None:
+            self._clarify_state.pop(clarify_id, None)
+            await self._notify_clarify_expired(query, user_display)
+            return
+        count = 0
+        with contextlib.suppress(Exception):
+            count = len(_cg._entries[clarify_id].choices or [])
+        with contextlib.suppress(Exception):
+            await query.edit_message_reply_markup(reply_markup=self._clarify_keyboard(clarify_id, count, selected=selected))
+        picked = ", ".join(str(i + 1) for i in sorted(selected)) or "none"
+        await query.answer(text=f"Selected: {picked}")
 
     async def _handle_update_prompt_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """``update_prompt:<y|n>`` — forward the answer to the update process."""

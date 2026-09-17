@@ -326,10 +326,18 @@ class GatewayInboundMixin:
             _pending_clarify = _clarify_mod.get_pending_for_session(_quick_key, include_choice_prompts=True)
         except Exception:
             return None
+        # Native poll votes (Photon): ``poll_vote`` marks the event, ``poll_selected`` False is a
+        # retracted vote. A retraction with nothing pending is never a user turn — swallow it.
+        _poll_vote = bool((event.metadata or {}).get("poll_vote"))
+        _poll_selected = bool((event.metadata or {}).get("poll_selected", True)) if _poll_vote else True
         if _pending_clarify is None:
-            return None
+            return "" if _poll_vote and not _poll_selected else None
         _clarify_has_audio = bool(self._pending_event_audio_paths(event))
         _raw_clarify_reply = await self._prepare_clarify_reply_text(event)
+        if _poll_vote:
+            _poll_outcome = self._hm_clarify_poll_vote(_pending_clarify, _raw_clarify_reply, _poll_selected)
+            if _poll_outcome is not None:
+                return _poll_outcome
 
         def _retain(why: str) -> str:
             logger.info(
@@ -369,6 +377,25 @@ class GatewayInboundMixin:
             # execute, and that steer cannot drain until the clarify tool returns.
             _clarify_mod.resolve_gateway_clarify(_pending_clarify.clarify_id, "")
         return None
+
+    @staticmethod
+    def _hm_clarify_poll_vote(pending, label: str, selected: bool) -> Optional[str]:
+        """Route a native poll vote at a pending clarify. Multi-select: a vote toggles the row
+        (retractions toggle off) and a vote for the Done row resolves with every toggled label —
+        both return "" (consumed). Single-select: a retraction is consumed; a selection returns
+        None so the ordinary text path resolves it with the option label."""
+        from tools import clarify_gateway as _clarify_mod
+        if not pending.multi_select:
+            return "" if not selected else None
+        text = str(label or "").strip()
+        if selected and text.casefold() == _clarify_mod.MULTI_SELECT_DONE_LABEL.casefold():
+            value = _clarify_mod.resolve_multi_selection(pending.clarify_id)
+            if value:
+                logger.info("Gateway resolved multi-select clarify from poll (id=%s)", pending.clarify_id)
+            return ""
+        if _clarify_mod.toggle_selection_by_label(pending.clarify_id, text, selected=selected) is None:
+            logger.debug("Poll vote %r did not match a pending multi-select row (id=%s)", text, pending.clarify_id)
+        return ""
 
     # Reply → choice for a pending slash-confirm prompt; the command spelling wins over the
     # bang/slash-stripped free-text spelling.

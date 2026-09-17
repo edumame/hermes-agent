@@ -5339,14 +5339,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 color=discord.Color.orange(),
             )
             # 5 buttons × 5 rows = 25; one slot is reserved for "Other".
-            clean_choices = [s for s in (_flatten_choice(c) for c in (choices or [])) if s][:24]
+            multi = False
+            try:
+                from tools.clarify_gateway import is_multi_select
+                multi = is_multi_select(clarify_id)
+            except Exception:
+                multi = False
+            # 5 buttons × 5 rows = 25; "Other" (and "Done" for multi-select) reserve slots.
+            clean_choices = [s for s in (_flatten_choice(c) for c in (choices or [])) if s][:23 if multi else 24]
             if clean_choices:
-                hint = "Pick one below, or click ✏️ Other to type a custom answer."
+                hint = ("Toggle one or more below, then click ✅ Done (or ✏️ Other to type a custom answer)."
+                        if multi else "Pick one below, or click ✏️ Other to type a custom answer.")
                 embed.add_field(name="Choices", value=hint, inline=False)
                 view = ClarifyChoiceView(
                     choices=clean_choices, clarify_id=clarify_id,
                     allowed_user_ids=self._allowed_user_ids,
                     allowed_role_ids=self._allowed_role_ids,
+                    multi_select=multi,
                 )
             else:
                 hint = "Reply in this channel with your answer."
@@ -6408,19 +6417,34 @@ def _define_discord_view_classes() -> None:
     class ClarifyChoiceView(_HermesView):
         """One button per clarify choice (max 24) plus ``✏️ Other``. A numeric click resolves the
         gateway clarify entry immediately; ``Other`` flips to text-capture (next message answers).
-        Single-use: after the first valid click all buttons disable."""
+        Single-use: after the first valid click all buttons disable.
 
-        def __init__(self, choices: List[str], clarify_id: str, allowed_user_ids: set, allowed_role_ids: Optional[set] = None):
+        ``multi_select``: choice buttons toggle (``☐`` ↔ ``☑``, secondary ↔ success) and stay
+        live; a ``✅ Done`` button resolves the entry with every toggled label (JSON array)."""
+
+        def __init__(self, choices: List[str], clarify_id: str, allowed_user_ids: set, allowed_role_ids: Optional[set] = None,
+                     *, multi_select: bool = False):
             super().__init__(allowed_user_ids, allowed_role_ids, timeout=_read_discord_prompt_timeout())
-            self.choices = list(choices)[:24]
+            self.multi_select = bool(multi_select)
+            self.choices = list(choices)[:23 if self.multi_select else 24]
             self.clarify_id = clarify_id
+            self._choice_buttons: List[Any] = []
             for index, choice in enumerate(self.choices):
                 button = discord.ui.Button(
-                    label=self._button_label(index, choice), style=discord.ButtonStyle.primary,
+                    label=self._button_label(index, choice, checked=False if self.multi_select else None),
+                    style=discord.ButtonStyle.secondary if self.multi_select else discord.ButtonStyle.primary,
                     custom_id=f"clarify:{clarify_id}:{index}",
                 )
                 button.callback = self._make_choice_callback(index, choice)
                 self.add_item(button)
+                self._choice_buttons.append(button)
+            if self.multi_select:
+                done_btn = discord.ui.Button(
+                    label="✅ Done", style=discord.ButtonStyle.primary,
+                    custom_id=f"clarify:{clarify_id}:done",
+                )
+                done_btn.callback = self._on_done
+                self.add_item(done_btn)
             other_btn = discord.ui.Button(
                 label="✏️ Other (type answer)", style=discord.ButtonStyle.secondary,
                 custom_id=f"clarify:{clarify_id}:other",
@@ -6429,11 +6453,13 @@ def _define_discord_view_classes() -> None:
             self.add_item(other_btn)
 
         @staticmethod
-        def _button_label(index: int, choice: str) -> str:
-            """``"N. <choice>"`` within Discord's 80-char (UTF-16) label cap.
+        def _button_label(index: int, choice: str, checked: Optional[bool] = None) -> str:
+            """``"N. <choice>"`` within Discord's 80-char (UTF-16) label cap (``checked`` prepends
+            the multi-select ``☐``/``☑`` box).
             Mobile wraps early, so long choices cut at a word boundary in the trailing half, else a
             soft boundary (``- , . )``, inclusive), else hard."""
-            prefix = f"{index + 1}. "
+            box = "" if checked is None else ("☑ " if checked else "☐ ")
+            prefix = f"{box}{index + 1}. "
             budget = _DISCORD_BUTTON_LABEL_LIMIT - utf16_len(prefix)
             if utf16_len(choice) <= budget:
                 return f"{prefix}{choice}"
@@ -6452,8 +6478,63 @@ def _define_discord_view_classes() -> None:
 
         def _make_choice_callback(self, index: int, choice: str):
             async def _callback(interaction: "discord.Interaction"):
-                await self._resolve_choice(interaction, index, choice)
+                if self.multi_select:
+                    await self._toggle_choice(interaction, index, choice)
+                else:
+                    await self._resolve_choice(interaction, index, choice)
             return _callback
+
+        async def _toggle_choice(self, interaction: "discord.Interaction", index: int, choice: str) -> None:
+            """Multi-select: flip the row's check state in the shared entry and repaint the button."""
+            if not await self._gate(
+                interaction, resolved_msg="This prompt has already been answered~",
+                unauth_msg="You're not authorized to answer this prompt~",
+            ):
+                return
+            try:
+                from tools.clarify_gateway import toggle_selection
+                selected = toggle_selection(self.clarify_id, index)
+            except Exception as exc:
+                logger.warning("Discord clarify toggle failed (id=%s): %s", self.clarify_id, exc)
+                selected = None
+            if selected is None:  # entry evicted / gateway restarted
+                await self._finish(interaction, discord.Color.greyple(), "⏳ Prompt expired — please send a new request", log_edit_failure=False)
+                return
+            chosen = set(selected)
+            for i, button in enumerate(self._choice_buttons):
+                button.label = self._button_label(i, self.choices[i], checked=i in chosen)
+                button.style = discord.ButtonStyle.success if i in chosen else discord.ButtonStyle.secondary
+            try:
+                await interaction.response.edit_message(view=self)
+            except Exception:
+                try:
+                    await interaction.response.defer()
+                except Exception:
+                    pass
+
+        async def _on_done(self, interaction: "discord.Interaction") -> None:
+            """Multi-select: resolve with every toggled label; nothing toggled keeps the prompt live."""
+            if not await self._gate(
+                interaction, resolved_msg="This prompt has already been answered~",
+                unauth_msg="You're not authorized to answer this prompt~",
+            ):
+                return
+            try:
+                from tools.clarify_gateway import resolve_multi_selection, selected_labels
+                labels = selected_labels(self.clarify_id)
+                value = resolve_multi_selection(self.clarify_id)
+            except Exception as exc:
+                logger.warning("Discord clarify done failed (id=%s): %s", self.clarify_id, exc)
+                value, labels = None, []
+            if value == "":
+                await interaction.response.send_message("Select at least one option first~", ephemeral=True)
+                return
+            display_name = getattr(getattr(interaction, "user", None), "display_name", "user")
+            if value is None:
+                await self._finish(interaction, discord.Color.greyple(), "⏳ Prompt expired — please send a new request", log_edit_failure=False)
+                return
+            await self._finish(interaction, discord.Color.green(), f"Answered by {display_name}: {', '.join(labels)}", log_edit_failure=True)
+            logger.info("Discord multi-select clarify resolved (id=%s, count=%d, user=%s)", self.clarify_id, len(labels), display_name)
 
         async def _finish(self, interaction: "discord.Interaction", color, footer: str, *, log_edit_failure: bool) -> None:
             """Disable the buttons and stamp the embed; fall back to a bare defer."""

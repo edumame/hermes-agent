@@ -759,16 +759,15 @@ class PhotonAdapter(BasePlatformAdapter):
         # gate: reacting to a non-wake-word group message is valid.
         self._record_last_inbound(space_id, message_id)
         if ctype == "poll_option":
-            # Native poll vote: a selection is forwarded as if typed (the gateway's
-            # pending-clarify intercept resolves it); a deselection is dropped.
-            if content.get("selected") is False:
-                logger.debug("[photon] ignoring poll deselection")
-                return
+            # Native poll vote: forwarded as if typed, tagged ``poll_vote`` so the gateway's
+            # pending-clarify intercept can resolve a single-select prompt, toggle a row of a
+            # multi-select one (deselections included), and swallow stray deselections.
             choice = (content.get("title") or "").strip()
             if not choice:
                 logger.debug("[photon] ignoring poll vote with empty title")
                 return
-            await self.handle_message(_event(choice))
+            selected = content.get("selected") is not False
+            await self.handle_message(_event(choice, metadata={"poll_vote": True, "poll_selected": selected}))
             return
         if ctype in _BINARY_CONTENT_TYPES:
             # Base64 decode + media-cache write of possibly multi-MB payloads — keep it off the event loop.
@@ -1102,9 +1101,16 @@ class PhotonAdapter(BasePlatformAdapter):
         text-capture mode like the base fallback."""
         if not choices:  # open-ended: base plain-text behaviour is right
             return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
-        from tools.clarify_gateway import mark_awaiting_text
-        mark_awaiting_text(clarify_id)
-        result = await self._sidecar_send_poll(chat_id, question, list(choices))
+        from tools.clarify_gateway import MULTI_SELECT_DONE_LABEL, is_multi_select, mark_awaiting_text
+        options = list(choices)
+        if is_multi_select(clarify_id):
+            # A native poll has no Done button, so the last row is one: votes toggle rows in the
+            # shared entry and a vote for Done resolves it (gateway ``_hm_clarify_reply``). The entry
+            # stays in choice mode so typed prose can't resolve a multi-select prompt by accident.
+            options.append(MULTI_SELECT_DONE_LABEL)
+        else:
+            mark_awaiting_text(clarify_id)
+        result = await self._sidecar_send_poll(chat_id, question, options)
         if not result.success:
             # Old sidecar without /send-poll or a send error: numbered-text clarify fallback
             # (base also calls mark_awaiting_text; harmless).

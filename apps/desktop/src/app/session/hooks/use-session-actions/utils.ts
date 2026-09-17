@@ -172,10 +172,14 @@ const COMPARED_FIELDS = [
   'completedAt',
   // Turn wall-clock duration — stamps the visible "⏱ 38s" badge, so a change
   // must re-render (set once at completion; stable afterwards).
-  'durationS'
+  'durationS',
+  // A contributed presentation kind swaps the whole body renderer.
+  'displayKind'
 ] as const
 
-const IGNORED_FIELDS = ['attachmentRefs', 'parts', 'rowId'] as const
+// displayMetadata — a persisted kind's payload; it never changes for a row
+// (the kind string and the text already flag a different turn).
+const IGNORED_FIELDS = ['attachmentRefs', 'displayMetadata', 'parts', 'rowId'] as const
 
 // Compile-time check: every ChatMessagePart discriminant must be handled by
 // chatPartsEquivalent. If @assistant-ui adds a new part type, this fails tsc.

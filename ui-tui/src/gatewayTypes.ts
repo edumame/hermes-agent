@@ -48,6 +48,33 @@ export interface SlashExecResponse {
   warning?: string
 }
 
+// ── /compare (tui_gateway/methods_compare.py) ────────────────────────
+
+export interface CompareOptionsResponse {
+  choices?: string[]
+  current?: string
+  /** The last comparison's `provider:model` labels — the picker starts with them checked. */
+  selected?: string[]
+}
+
+export interface CompareRunResult {
+  cost_usd?: null | number
+  elapsed_s?: number
+  error?: null | string
+  input_tokens?: number
+  label?: string
+  model?: string
+  ok?: boolean
+  output_tokens?: number
+  provider?: string
+  text?: string
+}
+
+export interface CompareRunResponse {
+  prompt?: string
+  results?: CompareRunResult[]
+}
+
 // ── Remote Spending (Phase 2b) ───────────────────────────────────────
 
 // Wire shapes now live in @hermes/shared for reuse by TypeScript clients.

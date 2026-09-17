@@ -1,0 +1,280 @@
+"""``/compare`` — one prompt, several models, every answer printed separately.
+
+Bound onto ``GatewayRunner`` through ``GatewaySlashCommandsMixin``. The command asks which models
+to compare through the gateway's clarify prompt in **multi-select** mode (button adapters render
+toggle rows + Done, native-poll adapters a multi-vote poll, everything else a numbered list the
+text-intercept parses as ``1, 3``), then fans the prompt out through ``agent/model_compare.py``
+and posts each answer as it lands. ``--models a:b,c:d`` skips the poll. The live session is never
+touched: no history rows, no model switch, no prompt-cache impact (same contract as ``/btw``). A
+finished run is saved as its OWN chat in the serving profile's session store — the same
+``agent.model_compare.persist_comparison_chat`` writer the desktop page and the TUI picker use through
+``compare.save`` — so the desktop sidebar lists it beside comparisons run anywhere else and it can be
+resumed there (before this the run lived only in the messaging thread and never reached the desktop).
+
+The models of the last comparison are saved per profile (``agent.model_compare.save_candidates``):
+a later bare ``/compare <prompt>`` reuses them without a poll — button rows cannot be pre-toggled
+on a phone, so re-asking every time was the friction this removes — and ``--pick`` opens the
+poll again.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import uuid
+from typing import List, Optional
+
+from agent.model_compare import (
+    SUGGEST_MAX_LABELS, SUGGEST_MODELS_PER_PROVIDER, parse_compare_args, parse_compare_options,
+    suggest_candidate_labels,
+)
+from gateway.platforms.event import MessageEvent
+
+logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.py
+
+# The poll offers ``agent.model_compare.SUGGEST_MAX_LABELS`` rows (Discord caps a view at 24 buttons,
+# Telegram stacks rows; more than that is noise on a phone). The session's current model is row 1.
+COMPARE_POLL_MAX_CHOICES = SUGGEST_MAX_LABELS
+_COMPARE_POLL_MODELS_PER_PROVIDER = SUGGEST_MODELS_PER_PROVIDER
+# A poll left unanswered releases the command well before the (hour-long) tool clarify default.
+COMPARE_POLL_TIMEOUT_S = 600
+# ``sessions.source`` of a comparison saved from a messaging ``/compare``. A LOCAL source id (the desktop
+# keeps ``gateway`` in its main Chats list, next to the TUI's ``tui`` and the page's ``desktop`` saves)
+# rather than the platform's own: the chat is the saved comparison, not a Telegram/Discord thread, so it
+# must not land in a platform section the desktop treats as a bot conversation.
+COMPARE_CHAT_SOURCE = "gateway"
+_parse_compare_args = parse_compare_args
+
+
+def _decode_poll_reply(reply: str) -> List[str]:
+    """A multi-select clarify resolves to a JSON array of labels; a typed single label is a bare
+    string; ``[...]`` sentinels (timeout, undeliverable) and empty replies mean no selection."""
+    text = str(reply or "").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            return []  # "[user did not respond within 10m]" and friends
+        return [str(x).strip() for x in decoded if str(x).strip()] if isinstance(decoded, list) else []
+    return [s.strip() for s in text.split(",") if s.strip()]
+
+
+def _poll_choices(providers: List[dict], *, current_provider: str, current_model: str) -> List[str]:
+    """``provider:model`` rows for the poll (see ``suggest_candidate_labels``)."""
+    return suggest_candidate_labels(
+        providers, current_provider=current_provider, current_model=current_model,
+        limit=COMPARE_POLL_MAX_CHOICES, per_provider=_COMPARE_POLL_MODELS_PER_PROVIDER)
+
+
+class GatewayCompareCommandsMixin:
+    """``/compare`` handler."""
+
+    def _compare_usage(self, event: MessageEvent) -> str:
+        prefix = self._typed_command_prefix_for(event.source.platform)
+        return (
+            f"Usage: {prefix}compare <prompt>\n"
+            f"       {prefix}compare --models openrouter:openai/gpt-5,anthropic:claude-opus-5 <prompt>\n"
+            f"       {prefix}compare --pick <prompt>\n\n"
+            "Sends the prompt to several models and prints every answer separately so you can compare "
+            "them. Without --models you get a poll of models on your configured providers (select several, then Done). "
+            "The models you picked are remembered: the next bare compare reuses them, --pick asks again."
+        )
+
+    async def _compare_listing(self, event: MessageEvent, source, profile_home) -> tuple[List[dict], str, str]:
+        """Explicitly configured provider rows (``hermes_cli.inventory.compare_provider_rows``) + the
+        session's current ``(provider, model)`` for the poll."""
+        from gateway.run import _hermes_home
+        from gateway.slash_commands_model import _ModelSwitchContext
+        from hermes_cli.config import stringify_provider_map
+        from hermes_cli.inventory import ConfigContext, compare_provider_rows
+
+        session_key = self._session_key_for_source(source)
+        ctx = _ModelSwitchContext(
+            session_key=session_key, source=source,
+            config_path=(profile_home or _hermes_home) / "config.yaml", persist_global=False)
+        ctx.read_config()
+        ctx.apply_override(getattr(self, "_session_model_overrides", {}).get(session_key, {}))
+        try:
+            current_model, rt = self._resolve_session_agent_runtime(source=source)
+            current_provider = str(rt.get("provider") or ctx.current_provider or "")
+        except Exception:
+            current_model, current_provider = ctx.current_model, ctx.current_provider
+        picker_ctx = ConfigContext(
+            current_provider=str(ctx.current_provider or ""), current_model=str(ctx.current_model or ""),
+            current_base_url=str(ctx.current_base_url or ""),
+            user_providers=stringify_provider_map(ctx.user_provs), custom_providers=ctx.custom_provs,
+            excluded_providers=list(ctx.excluded_provs or []))
+        try:  # off-loop: listing can hit a stale-cache HTTP fetch
+            providers = await asyncio.to_thread(
+                compare_provider_rows, picker_ctx, max_models=_COMPARE_POLL_MODELS_PER_PROVIDER)
+        except Exception as exc:
+            logger.debug("/compare provider listing failed: %s", exc)
+            providers = []
+        return providers, str(current_provider or ""), str(current_model or "")
+
+    async def _compare_poll(self, adapter, source, event: MessageEvent, choices: List[str]) -> List[str]:
+        """Multi-select clarify poll → chosen ``provider:model`` labels (empty on timeout/cancel)."""
+        from tools import clarify_gateway as clarify_mod
+
+        session_key = self._session_key_for_source(source)
+        clarify_id = uuid.uuid4().hex[:10]
+        clarify_mod.register(
+            clarify_id=clarify_id, session_key=session_key,
+            question="Which models should answer? Pick one or more, then Done.",
+            choices=choices, multi_select=True)
+        try:
+            sent = await adapter.send_clarify(
+                chat_id=source.chat_id, question="Which models should answer? Pick one or more, then Done.",
+                choices=choices, clarify_id=clarify_id, session_key=session_key,
+                metadata=self._reply_metadata(event))
+        except Exception as exc:
+            logger.warning("/compare poll send failed: %s", exc)
+            sent = None
+        if sent is None or not getattr(sent, "success", False):
+            clarify_mod.clear_session(session_key)
+            return []
+        timeout = min(COMPARE_POLL_TIMEOUT_S, max(1, int(clarify_mod.get_clarify_timeout() or COMPARE_POLL_TIMEOUT_S)))
+        reply = await asyncio.to_thread(clarify_mod.wait_for_response, clarify_id, float(timeout))
+        return _decode_poll_reply(reply or "")
+
+    def _compare_chat_profile_name(self, source, profile_home) -> Optional[str]:
+        """The ``profile_name`` the saved chat is stamped with: the routed profile under multiplexing,
+        else the active one. None (unstamped) when that cannot be resolved — never a wrong name."""
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            name = ""
+            if profile_home is not None:
+                name = (getattr(source, "profile", None) or "").strip() or (self._profile_name_for_source(source) or "")
+            return name or get_active_profile_name() or "default"
+        except Exception:
+            return None
+
+    def _persist_comparison_chat(self, source, profile_home, prompt: str, results) -> Optional[str]:
+        """Save a finished run as its own chat in the serving profile's session store (the ONE writer
+        every surface shares, ``agent.model_compare.persist_comparison_chat``), so the desktop sidebar
+        and the TUI list it like a comparison run there and it can be resumed. Called inside the
+        profile scope: ``self._session_db`` then resolves that profile's ``state.db``. Returns the
+        chat's title, or None when nothing was saved: an all-failed run earns no chat (parity with the
+        TUI), and a store failure is logged, never raised — the answers were already delivered."""
+        from agent.model_compare import persist_comparison_chat
+        from hermes_state_ids import new_session_id
+
+        if not any(r.ok for r in results):
+            return None
+        try:
+            wrapper = self._session_db
+            db = getattr(wrapper, "_db", wrapper)  # AsyncSessionDB → the blocking SessionDB (we are off-loop)
+            if db is None:
+                logger.warning("/compare: session store unavailable, comparison not saved as a chat")
+                return None
+            _key, title = persist_comparison_chat(
+                db, prompt, list(results), session_id=new_session_id(), source=COMPARE_CHAT_SOURCE,
+                profile_name=self._compare_chat_profile_name(source, profile_home))
+            return title
+        except Exception as exc:
+            logger.warning("/compare: could not save the comparison as a chat: %s", exc, exc_info=True)
+            return None
+
+    async def _handle_compare_command(self, event: MessageEvent) -> str:
+        """Handle ``/compare [--models a:b,...] <prompt>``: poll (unless pinned), fan out, print."""
+        from agent.model_compare import (
+            MAX_COMPARE_CANDIDATES, format_result_message, format_summary_message, load_saved_candidates,
+            parse_candidate_list, run_comparison, save_candidates,
+        )
+
+        args = parse_compare_options(event.get_command_args())
+        specs, prompt = list(args.specs), args.prompt
+        if not prompt:
+            return self._compare_usage(event)
+        source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return "❌ No adapter for this chat."
+        profile_home = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            try:
+                profile_home = self._resolve_profile_home_for_source(event.source)
+            except Exception:
+                profile_home = None
+        reply_metadata = self._reply_metadata(event)
+        from hermes_constants import get_hermes_home
+        selection_home = profile_home or get_hermes_home()
+
+        def _scoped(fn, *args, **kwargs):
+            if profile_home is None:
+                return fn(*args, **kwargs)
+            from gateway.run import _profile_runtime_scope
+            with _profile_runtime_scope(profile_home):
+                return fn(*args, **kwargs)
+
+        async def _run() -> None:
+            try:
+                providers, current_provider, current_model = await self._compare_listing(event, source, profile_home)
+                saved = [] if (specs or args.pick) else load_saved_candidates(selection_home)
+                reused = bool(saved)
+                if specs:
+                    labels = specs
+                elif saved:
+                    labels = saved
+                else:
+                    choices = _poll_choices(providers, current_provider=current_provider, current_model=current_model)
+                    if len(choices) < 2:
+                        await adapter.send(
+                            source.chat_id,
+                            "❌ Fewer than two models are available to compare. Add provider credentials "
+                            "(hermes model) or pass --models provider:model,provider:model.",
+                            metadata=reply_metadata)
+                        return
+                    labels = await self._compare_poll(adapter, source, event, choices)
+                    if not labels:
+                        await adapter.send(source.chat_id, "🟡 Comparison cancelled — no models were selected.",
+                                           metadata=reply_metadata)
+                        return
+                candidates = parse_candidate_list(labels, default_provider=current_provider)
+                if not candidates:
+                    await adapter.send(source.chat_id, "❌ No valid models to compare.", metadata=reply_metadata)
+                    return
+                if len(candidates) > MAX_COMPARE_CANDIDATES:
+                    candidates = candidates[:MAX_COMPARE_CANDIDATES]
+                save_candidates(candidates, selection_home)  # the next bare /compare starts from these
+                names = ", ".join(c.display for c in candidates)
+                intro = (f"🔬 Comparing {len(candidates)} models (last selection): {names}\n"
+                         f"Add --pick to choose different models. " if reused
+                         else f"🔬 Comparing {len(candidates)} models: {names}\n")
+                await adapter.send(
+                    source.chat_id, f"{intro}Answers arrive as each model finishes…", metadata=reply_metadata)
+                loop = asyncio.get_running_loop()
+                total = len(candidates)
+
+                def _on_result(result, done, _total) -> None:
+                    text = format_result_message(result, index=done, total=total)
+                    fut = asyncio.run_coroutine_threadsafe(
+                        adapter.send(source.chat_id, text, metadata=reply_metadata), loop)
+                    try:
+                        fut.result(timeout=60)
+                    except Exception as exc:  # pragma: no cover - delivery is best-effort
+                        logger.warning("/compare answer delivery failed: %s", exc)
+
+                results = await asyncio.to_thread(
+                    _scoped, run_comparison, candidates, prompt, on_result=_on_result)
+                summary = format_summary_message(results)
+                # Inside the profile scope so ``_session_db`` resolves the serving profile's store.
+                saved_title = await asyncio.to_thread(
+                    _scoped, self._persist_comparison_chat, source, profile_home, prompt, results)
+                if saved_title:
+                    summary += (f"\n\n💾 Saved as chat “{saved_title}” — open it in the desktop or TUI "
+                                f"to continue from these answers.")
+                await adapter.send(source.chat_id, summary, metadata=reply_metadata)
+            except Exception as exc:
+                logger.warning("/compare failed: %s", exc, exc_info=True)
+                try:
+                    await adapter.send(source.chat_id, f"❌ /compare failed: {exc}", metadata=reply_metadata)
+                except Exception:
+                    pass
+
+        self._track_background_task(_run())
+        # The poll / progress messages are the visible reply; an ack here would double-post.
+        return ""

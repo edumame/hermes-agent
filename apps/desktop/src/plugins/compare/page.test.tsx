@@ -1,3 +1,4 @@
+import type * as PluginSdk from '@hermes/plugin-sdk'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -16,11 +17,25 @@ beforeAll(() => {
 })
 
 const runCandidate = vi.fn()
+const saveComparison = vi.fn()
+const openSession = vi.fn(async (..._args: unknown[]) => {})
+const invalidateQueries = vi.fn(async (..._args: unknown[]) => {})
 
 vi.mock('./api', async importOriginal => ({
   ...(await importOriginal<typeof CompareApi>()),
-  runCandidate: (...args: unknown[]) => runCandidate(...args)
+  runCandidate: (...args: unknown[]) => runCandidate(...args),
+  saveComparison: (...args: unknown[]) => saveComparison(...args)
 }))
+
+vi.mock('@hermes/plugin-sdk', async importOriginal => {
+  const sdk = await importOriginal<typeof PluginSdk>()
+
+  return {
+    ...sdk,
+    host: { ...sdk.host, notify: vi.fn(), openSession: (...args: unknown[]) => openSession(...args) },
+    queryClient: { ...sdk.queryClient, invalidateQueries: (...args: unknown[]) => invalidateQueries(...args) }
+  }
+})
 
 vi.mock('@/hermes', () => ({
   getGlobalModelOptions: vi.fn(async () => ({ providers: [] })),
@@ -47,6 +62,7 @@ let disposeLocales = () => {}
 beforeEach(() => {
   clearCandidates()
   disposeLocales = registerPluginLocales('compare', COMPARE_LOCALES)
+  saveComparison.mockResolvedValue({ stored_session_id: 'sess-1', title: 'Compare: why?' })
 })
 
 afterEach(() => {
@@ -96,6 +112,7 @@ describe('compare page', () => {
       { model: 'slow', provider: 'p' },
       { model: 'fast', provider: 'p' }
     ])
+
     let resolveSlow: (value: CompareRunResult) => void = () => {}
     runCandidate.mockImplementation((_prompt: string, candidate: { model: string }) =>
       candidate.model === 'fast'
@@ -121,11 +138,72 @@ describe('compare page', () => {
     expect(screen.getByText('1.5s · 10→4 tokens · $0.0020')).toBeTruthy()
     expect((screen.getByRole('button', { name: /Running…/ }) as HTMLButtonElement).disabled).toBe(true)
 
+    // Nothing is saved while a column is still running.
+    expect(saveComparison).not.toHaveBeenCalled()
+
     resolveSlow(row('slow', 'Slow answer', { elapsed_s: 12.4 }))
 
     expect(await screen.findByText('Slow answer')).toBeTruthy()
     await waitFor(() => expect(screen.queryByText('Waiting for the model…')).toBeNull())
     expect((screen.getByRole('button', { name: /^Run$/ }) as HTMLButtonElement).disabled).toBe(false)
+
+    // Every column settled: the run is saved as a chat, rows in candidate
+    // order, and the sidebar is told a chat appeared.
+    expect(await screen.findByText('Saved as a chat')).toBeTruthy()
+    expect(saveComparison).toHaveBeenCalledTimes(1)
+    expect(saveComparison).toHaveBeenCalledWith('why?', [
+      row('slow', 'Slow answer', { elapsed_s: 12.4 }),
+      row('fast', 'Fast answer')
+    ])
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ['sessions'] })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat' }))
+
+    expect(openSession).toHaveBeenCalledWith('sess-1', { intent: 'in-place' })
+  })
+
+  it('records a request failure as a failed row in the saved chat', async () => {
+    $candidates.set([
+      { model: 'ok', provider: 'p' },
+      { model: 'broken', provider: 'p' }
+    ])
+    runCandidate.mockImplementation((_prompt: string, candidate: { model: string }) =>
+      candidate.model === 'ok' ? Promise.resolve(row('ok', 'Answer')) : Promise.reject(new Error('socket closed'))
+    )
+    render(<ComparePage />)
+
+    fireEvent.change(screen.getByPlaceholderText(/Ask every selected model/), { target: { value: 'q' } })
+    fireEvent.click(screen.getByRole('button', { name: /^Run$/ }))
+
+    expect(await screen.findByText('Saved as a chat')).toBeTruthy()
+    expect(saveComparison).toHaveBeenCalledWith('q', [
+      row('ok', 'Answer'),
+      {
+        elapsed_s: 0,
+        error: 'socket closed',
+        input_tokens: 0,
+        label: 'p: broken',
+        model: 'broken',
+        ok: false,
+        output_tokens: 0,
+        provider: 'p',
+        text: ''
+      }
+    ])
+  })
+
+  it('shows why a save failed without touching the columns', async () => {
+    $candidates.set([{ model: 'm1', provider: 'p' }])
+    runCandidate.mockResolvedValue(row('m1', 'Answer'))
+    saveComparison.mockRejectedValueOnce(new Error('session store unavailable'))
+    render(<ComparePage />)
+
+    fireEvent.change(screen.getByPlaceholderText(/Ask every selected model/), { target: { value: 'q' } })
+    fireEvent.click(screen.getByRole('button', { name: /^Run$/ }))
+
+    expect(await screen.findByText('Could not save as a chat: session store unavailable')).toBeTruthy()
+    expect(screen.getByText('Answer')).toBeTruthy()
+    expect(invalidateQueries).not.toHaveBeenCalled()
   })
 
   it('renders provider failures and request errors as failed columns', async () => {
@@ -145,5 +223,9 @@ describe('compare page', () => {
 
     expect(await screen.findByText('Failed: rate limited')).toBeTruthy()
     expect(await screen.findByText('Failed: socket closed')).toBeTruthy()
+
+    // No model answered: nothing worth a sidebar row.
+    expect(await screen.findByText('Not saved: no model answered')).toBeTruthy()
+    expect(saveComparison).not.toHaveBeenCalled()
   })
 })

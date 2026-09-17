@@ -21,10 +21,18 @@ const ANSWER_MAX_CHARS = 3500
 const asResult = (label: string, r: CompareRunResponse | null | undefined): CompareRunResult =>
   r?.results?.[0] ?? { error: 'no result', label }
 
+/** The chat a finished comparison was saved as (`compare.save`). */
+interface CompareSaveResponse {
+  stored_session_id?: string
+  title?: string
+}
+
 /**
  * Fan `prompt` out to `specs` — one `compare.run` request per model so answers paint as they
- * land — then print the scoreboard. Runs against the TUI's own gateway (not the slash worker):
- * a comparison can outlive the worker's per-command budget, and the session is never touched.
+ * land — then print the scoreboard and save the run as its own chat (`compare.save`: the prompt
+ * plus every answer, titled `Compare: <prompt>`), so it survives the transcript scrolling away and
+ * can be resumed like any session. Runs against the TUI's own gateway (not the slash worker): a
+ * comparison can outlive the worker's per-command budget, and the live session is never touched.
  */
 export function runComparison(ctx: SlashRunCtx, prompt: string, specs: readonly string[]): void {
   const { panel, sys } = ctx.transcript
@@ -36,6 +44,8 @@ export function runComparison(ctx: SlashRunCtx, prompt: string, specs: readonly 
 
   const total = labels.length
   const results: CompareRunResult[] = []
+  // The rows the saved chat records, in candidate order (`results` is completion order).
+  const byLabel = new Map<string, CompareRunResult>()
 
   sys(`🔬 comparing ${total} model${total === 1 ? '' : 's'}: ${labels.join(', ')} — answers appear as each finishes`)
 
@@ -64,12 +74,33 @@ export function runComparison(ctx: SlashRunCtx, prompt: string, specs: readonly 
         COMPARE_RPC_TIMEOUT_MS
       )
       .then(
-        r => show(asResult(label, r)),
-        (e: unknown) => show({ error: e instanceof Error ? e.message : String(e), label })
+        r => asResult(label, r),
+        (e: unknown): CompareRunResult => ({ error: e instanceof Error ? e.message : String(e), label })
       )
+      .then(result => {
+        byLabel.set(label, result)
+        show(result)
+      })
   )
 
-  void Promise.all(requests).then(() => sys(compareSummaryLines(results).join('\n')))
+  void Promise.all(requests).then(async () => {
+    sys(compareSummaryLines(results).join('\n'))
+
+    // Only a run somebody answered earns a chat; an all-failed run stays in the transcript.
+    if (!results.some(compareResultOk)) {
+      return
+    }
+
+    const rows = labels.map(label => byLabel.get(label)).filter((r): r is CompareRunResult => r !== undefined)
+
+    try {
+      const saved = await ctx.gateway.gw.request<CompareSaveResponse>('compare.save', { prompt, results: rows })
+
+      sys(`💾 saved as chat: ${saved?.title ?? 'Compare'} — /resume ${saved?.stored_session_id ?? '?'} to continue from it`)
+    } catch (e: unknown) {
+      sys(`⚠️ could not save the comparison as a chat: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  })
 }
 
 export const compareCommands: SlashCommand[] = [

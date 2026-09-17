@@ -141,6 +141,29 @@ function parseDisplayMetadata(metadata: SessionMessage['display_metadata']): nul
   return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null
 }
 
+/** Kinds core paints itself (timeline rows, hidden scaffolding, steer echoes);
+ *  anything else on an assistant turn is offered to a contributed renderer. */
+const CORE_DISPLAY_KINDS = new Set([
+  'async_delegation_complete',
+  'auto_continue',
+  'hidden',
+  'model_switch',
+  'personality_switch',
+  'process_complete',
+  'skill_invocation',
+  'steer'
+])
+
+function contributedKind(message: SessionMessage): { displayKind: string; displayMetadata: Record<string, unknown> } | null {
+  const kind = message.display_kind
+
+  if (message.role !== 'assistant' || !kind || CORE_DISPLAY_KINDS.has(kind)) {
+    return null
+  }
+
+  return { displayKind: kind, displayMetadata: parseDisplayMetadata(message.display_metadata) ?? {} }
+}
+
 function timelineTaskCount(metadata: SessionMessage['display_metadata']): number | undefined {
   const count = parseDisplayMetadata(metadata)?.task_count
 
@@ -420,6 +443,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     const reactions = messageReactions(message.display_metadata)
+    const kind = contributedKind(message)
     // Gateway resume names the durable row id `row_id`; the REST transcript
     // prefetch ships the same messages.id as a numeric `id`. Either one lets
     // reactions address this exact row later.
@@ -435,6 +459,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       timestamp: earliestTimestamp(message.timestamp, ...parts.map(part => part.timestamp)),
       ...(rowId !== undefined ? { rowId } : {}),
       ...(reactions.length ? { reactions } : {}),
+      ...(kind ?? {}),
       ...(extractedAttachmentRefs ? { attachmentRefs: extractedAttachmentRefs } : {})
     })
 

@@ -1,10 +1,12 @@
 /**
  * The Compare page — mounted at `/compare` (a ROUTES_AREA contribution) in the
- * workspace pane. A workbench, not a chat: pick models through the SAME
- * catalog menu the composer uses (a selection ADDS a column instead of
- * switching a session), write one prompt, and read every answer side by side
- * as each model finishes. Nothing here touches a session: every column is a
- * stateless `compare.run` request.
+ * workspace pane. A workbench: pick models through the SAME catalog menu the
+ * composer uses (a selection ADDS a column instead of switching a session),
+ * write one prompt, and read every answer side by side as each model finishes.
+ * Every column is a stateless `compare.run` request — no live session is
+ * touched — and a finished run is saved as its own chat (`compare.save`), so
+ * comparisons outlive the page and can be reopened or continued from the
+ * sidebar like any conversation.
  */
 
 import {
@@ -22,12 +24,13 @@ import {
   ModelCatalogMenu,
   ModelMenuCloseContext,
   type ModelMenuController,
+  queryClient,
   Streamdown,
   Textarea,
   Tip,
   useValue
 } from '@hermes/plugin-sdk'
-import { type KeyboardEvent, useCallback, useRef, useState } from 'react'
+import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from 'react'
 
 import {
   $candidates,
@@ -37,15 +40,27 @@ import {
   clearCandidates,
   type CompareCandidate,
   type CompareRunResult,
+  failedRow,
   formatCost,
   formatElapsed,
   removeCandidate,
-  runCandidate
+  runCandidate,
+  saveComparison,
+  type SavedComparison
 } from './api'
 import { type CompareText, useCompareText } from './i18n'
 
 type ColumnState =
   { status: 'done'; result: CompareRunResult } | { status: 'error'; message: string } | { status: 'running' }
+
+/** Where the run is on its way to becoming a chat: `pending` until every
+ *  column settled, `skipped` when no model answered (nothing worth a sidebar
+ *  row), else the saved chat or why the save failed. */
+type SaveState =
+  | { status: 'failed'; message: string }
+  | { status: 'pending' }
+  | { status: 'saved'; chat: SavedComparison }
+  | { status: 'skipped' }
 
 interface RunState {
   columns: Record<string, ColumnState>
@@ -53,6 +68,27 @@ interface RunState {
    *  model afterwards never drops a column mid-read. */
   candidates: CompareCandidate[]
   prompt: string
+  saved: SaveState
+  startedAt: number
+}
+
+/** Seconds since `startedAt`, ticking once a second while `active`. A slow
+ *  model (a reasoning model can take minutes) must look alive, not stuck. */
+function useElapsedSeconds(startedAt: number, active: boolean): number {
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    if (!active) {
+      return
+    }
+
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+
+    return () => clearInterval(timer)
+  }, [active, startedAt])
+
+  return Math.max(0, Math.floor((now - startedAt) / 1000))
 }
 
 /** "Add model" — the shared catalog menu driven by an ADD controller: a pick
@@ -129,11 +165,23 @@ function CandidateChips({ c, disabled }: { c: CompareText; disabled: boolean }) 
   )
 }
 
-function ColumnHeader({ c, candidate, state }: { c: CompareText; candidate: CompareCandidate; state?: ColumnState }) {
+function ColumnHeader({
+  c,
+  candidate,
+  startedAt,
+  state
+}: {
+  c: CompareText
+  candidate: CompareCandidate
+  startedAt: number
+  state?: ColumnState
+}) {
+  const waiting = !state || state.status === 'running'
+  const elapsed = useElapsedSeconds(startedAt, waiting)
   let detail: string
   let tone = 'text-(--ui-text-tertiary)'
 
-  if (!state || state.status === 'running') {
+  if (waiting) {
     detail = c.waiting
   } else if (state.status === 'error') {
     detail = `${c.failed}: ${state.message}`
@@ -153,7 +201,8 @@ function ColumnHeader({ c, candidate, state }: { c: CompareText; candidate: Comp
           {candidateLabel(candidate)}
         </div>
         <div className={cn('truncate text-[0.6875rem] tabular-nums', tone)} title={detail}>
-          {detail}
+          <span>{detail}</span>
+          {waiting && <span className="ml-1">{c.elapsed(elapsed)}</span>}
         </div>
       </div>
       {!state || state.status === 'running' ? (
@@ -170,7 +219,17 @@ function ColumnHeader({ c, candidate, state }: { c: CompareText; candidate: Comp
   )
 }
 
-function ResultColumn({ c, candidate, state }: { c: CompareText; candidate: CompareCandidate; state?: ColumnState }) {
+function ResultColumn({
+  c,
+  candidate,
+  startedAt,
+  state
+}: {
+  c: CompareText
+  candidate: CompareCandidate
+  startedAt: number
+  state?: ColumnState
+}) {
   const body =
     state?.status === 'done' && state.result.ok ? (
       <div className="compare-answer text-sm text-foreground" data-selectable-text="true">
@@ -189,9 +248,53 @@ function ResultColumn({ c, candidate, state }: { c: CompareText; candidate: Comp
       className="flex min-h-0 w-[min(28rem,80vw)] shrink-0 snap-start flex-col overflow-hidden rounded-lg border border-(--ui-stroke-secondary)/50 bg-(--ui-bg-secondary)"
       data-testid="compare-column"
     >
-      <ColumnHeader c={c} candidate={candidate} state={state} />
+      <ColumnHeader c={c} candidate={candidate} startedAt={startedAt} state={state} />
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">{body}</div>
     </section>
+  )
+}
+
+/** The one-line save status under the composer: spinner while the chat is
+ *  being written, then the saved chat with a button that opens it. */
+function SaveStatus({ c, state }: { c: CompareText; state: SaveState }) {
+  if (state.status === 'pending') {
+    return (
+      <span className="flex items-center gap-1.5" data-testid="compare-save-status">
+        <GlyphSpinner ariaLabel={c.saving} />
+        {c.saving}
+      </span>
+    )
+  }
+
+  if (state.status === 'skipped') {
+    return <span data-testid="compare-save-status">{c.notSaved}</span>
+  }
+
+  if (state.status === 'failed') {
+    return (
+      <span className="text-destructive" data-testid="compare-save-status">
+        {c.saveFailed(state.message)}
+      </span>
+    )
+  }
+
+  return (
+    <span className="flex items-center gap-1.5" data-testid="compare-save-status">
+      <Codicon name="comment-discussion" size="0.8rem" />
+      {c.savedAsChat}
+      <Button
+        onClick={() => {
+          void host.openSession(state.chat.stored_session_id, { intent: 'in-place' }).catch((error: unknown) => {
+            host.notify({ message: error instanceof Error ? error.message : String(error) })
+          })
+        }}
+        size="xs"
+        type="button"
+        variant="ghost"
+      >
+        {c.openChat}
+      </Button>
+    </span>
   )
 }
 
@@ -221,23 +324,60 @@ export function ComparePage() {
       columns[candidateKey(candidate)] = { status: 'running' }
     }
 
-    setRun({ candidates: targets, columns, prompt: text })
+    setRun({ candidates: targets, columns, prompt: text, saved: { status: 'pending' }, startedAt: Date.now() })
 
-    const settle = (candidate: CompareCandidate, state: ColumnState) => {
+    // The rows the saved chat records, keyed like the columns: a backend row
+    // for a finished model, a synthesized failed row when the request itself
+    // failed, so the transcript names every model that was asked.
+    const rows = new Map<string, CompareRunResult>()
+
+    const settle = (candidate: CompareCandidate, state: Exclude<ColumnState, { status: 'running' }>) => {
       if (runId.current !== id) {
         return
       }
 
+      rows.set(candidateKey(candidate), state.status === 'done' ? state.result : failedRow(candidate, state.message))
       setRun(prev => (prev ? { ...prev, columns: { ...prev.columns, [candidateKey(candidate)]: state } } : prev))
     }
 
-    for (const candidate of targets) {
+    const setSaved = (saved: SaveState) => {
+      if (runId.current === id) {
+        setRun(prev => (prev ? { ...prev, saved } : prev))
+      }
+    }
+
+    const requests = targets.map(candidate =>
       runCandidate(text, candidate).then(
         result => settle(candidate, { result, status: 'done' }),
         (error: unknown) =>
           settle(candidate, { message: error instanceof Error ? error.message : String(error), status: 'error' })
       )
-    }
+    )
+
+    // Every column settled: persist the run as a chat. Only a run somebody
+    // answered earns a sidebar row — all-failed runs stay on this page.
+    void Promise.all(requests).then(async () => {
+      if (runId.current !== id) {
+        return
+      }
+
+      const results = targets.map(candidate => rows.get(candidateKey(candidate))).filter((r): r is CompareRunResult => !!r)
+
+      if (!results.some(r => r.ok)) {
+        setSaved({ status: 'skipped' })
+
+        return
+      }
+
+      try {
+        const chat = await saveComparison(text, results)
+        // The sidebar reads its rows through the shared query cache: tell it a chat appeared.
+        void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+        setSaved({ chat, status: 'saved' })
+      } catch (error: unknown) {
+        setSaved({ message: error instanceof Error ? error.message : String(error), status: 'failed' })
+      }
+    })
   }, [prompt])
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -285,6 +425,12 @@ export function ComparePage() {
         </div>
       </div>
 
+      {run !== null && !running && (
+        <div className="flex shrink-0 items-center gap-2 px-4 pb-2 text-xs text-(--ui-text-tertiary)">
+          <SaveStatus c={c} state={run.saved} />
+        </div>
+      )}
+
       <div className="min-h-0 flex-1 px-4 pb-4">
         {run === null ? (
           <EmptyState className="h-full" description={c.emptyResultsHint} title={c.emptyResults} />
@@ -295,6 +441,7 @@ export function ComparePage() {
                 c={c}
                 candidate={candidate}
                 key={candidateKey(candidate)}
+                startedAt={run.startedAt}
                 state={run.columns[candidateKey(candidate)]}
               />
             ))}

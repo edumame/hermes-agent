@@ -805,8 +805,17 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
                 resp = handle_request(req)
             except Exception as exc:
                 resp = _err(req.get("id"), -32000, f"handler error: {exc}")
-            if resp is not None:
+            if resp is None:
+                return
+            # A write that raises (a result the transport cannot serialize, say) used to escape here
+            # and die inside the pool: no reply, no log, and the client waited out its timeout. Report
+            # it as the request's error instead — an error envelope is always serializable.
+            try:
                 t.write(resp)
+            except Exception as exc:
+                logger.exception("rpc response write failed method=%s id=%s", normalized[1], req.get("id"))
+                with contextlib.suppress(Exception):
+                    t.write(_err(req.get("id"), -32000, f"response write failed: {exc}"))
         _pool.submit(lambda: ctx.run(run))
         return None
     finally:

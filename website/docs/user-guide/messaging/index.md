@@ -226,7 +226,7 @@ platform network disconnect as an event-loop failure.
 | `/rollback [number]` | List or restore filesystem checkpoints |
 | `/bg <prompt>` | Run a prompt in a separate background session |
 | `/btw <question>` | Ask a side question about the current conversation without interrupting it |
-| `/compare [--models a:b,c:d] [--pick] <prompt>` | Send one prompt to several models and print every answer separately (a multi-select poll picks the models unless `--models` pins them; the picked models are remembered, so the next bare `/compare` reuses them and `--pick` polls again; Slack: `/hermes compare …`) |
+| `/compare [--models a:b,c:d] [--pick] <prompt>` | Send one prompt to several models and print every answer separately (a multi-select poll picks the models unless `--models` pins them; the picked models are remembered, so the next bare `/compare` reuses them and `--pick` polls again; Slack: `/hermes compare …`). Once every model has answered, the run is saved as its own chat titled `Compare: <prompt>` in the profile's session store, so it shows up in the desktop sidebar and the TUI's `/resume` list like a comparison run there; a run in which no model answered is not saved |
 | `/reload-mcp` | Reload MCP servers from config |
 | `/update` | Update Hermes Agent to the latest version |
 | `/help` | Show available commands |

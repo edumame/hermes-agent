@@ -8,6 +8,9 @@
 import {
   type HermesPlugin,
   host,
+  MESSAGE_KINDS_AREA,
+  type MessageKindContribution,
+  type MessageKindProps,
   PALETTE_AREA,
   type PaletteContribution,
   type RouteContribution,
@@ -19,6 +22,7 @@ import {
 import { bindCandidateStorage } from './api'
 import { COMPARE_LOCALES } from './i18n'
 import { ComparePage } from './page'
+import { CompareTranscript } from './transcript'
 
 export const COMPARE_PATH = '/compare'
 
@@ -46,6 +50,16 @@ const plugin: HermesPlugin = {
           label: ctx.i18n.t('nav'),
           path: COMPARE_PATH
         } satisfies SidebarNavContribution
+      },
+      {
+        // A saved comparison inside a chat paints as cards with a
+        // "continue with this model" action instead of its markdown.
+        id: 'transcript',
+        area: MESSAGE_KINDS_AREA,
+        data: {
+          displayKind: 'compare',
+          render: (props: MessageKindProps) => <CompareTranscript {...props} />
+        } satisfies MessageKindContribution
       },
       {
         id: 'open',

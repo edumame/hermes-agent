@@ -101,8 +101,12 @@ describe('createSlashHandler', () => {
   })
 
   it('opens the model checklist for /compare <prompt> and fans out on pick', async () => {
-    const request = vi.fn(() =>
-      Promise.resolve({ results: [{ elapsed_s: 1, label: 'a:b', ok: true, output_tokens: 2, text: 'hi' }] })
+    const answered = { elapsed_s: 1, label: 'a:b', ok: true, output_tokens: 2, text: 'hi' }
+
+    const request = vi.fn((method: string) =>
+      method === 'compare.save'
+        ? Promise.resolve({ stored_session_id: 'sess-1', title: 'Compare: explain monads' })
+        : Promise.resolve({ results: [answered] })
     )
 
     const ctx = buildCtx({ gateway: { ...buildGateway(), gw: { ...buildGateway().gw, request } } })
@@ -126,6 +130,38 @@ describe('createSlashHandler', () => {
     await vi.waitFor(() =>
       expect(ctx.transcript.sys).toHaveBeenCalledWith(expect.stringContaining('📊 comparison summary'))
     )
+    // Every answer in: the run is saved as a chat, rows in candidate order.
+    await vi.waitFor(() =>
+      expect(ctx.transcript.sys).toHaveBeenCalledWith(
+        '💾 saved as chat: Compare: explain monads — /resume sess-1 to continue from it'
+      )
+    )
+    expect(request).toHaveBeenCalledWith('compare.save', {
+      prompt: 'explain monads',
+      results: [answered, answered]
+    })
+  })
+
+  it('records a failed model in the saved chat and skips the save when nobody answered', async () => {
+    const request = vi.fn((method: string, params: { candidates?: string[] }) =>
+      method === 'compare.save'
+        ? Promise.resolve({ stored_session_id: 'sess-2', title: 'Compare: why?' })
+        : params.candidates?.[0] === 'a:b'
+          ? Promise.resolve({ results: [{ label: 'a:b', ok: true, text: 'yes' }] })
+          : Promise.reject(new Error('down'))
+    )
+
+    const ctx = buildCtx({ gateway: { ...buildGateway(), gw: { ...buildGateway().gw, request } } })
+
+    expect(createSlashHandler(ctx)('/compare --models a:b,c:d why?')).toBe(true)
+    await vi.waitFor(() => expect(ctx.transcript.sys).toHaveBeenCalledWith(expect.stringContaining('💾 saved as chat')))
+    expect(request).toHaveBeenCalledWith('compare.save', {
+      prompt: 'why?',
+      results: [
+        { label: 'a:b', ok: true, text: 'yes' },
+        { error: 'down', label: 'c:d' }
+      ]
+    })
   })
 
   it('skips the checklist when /compare pins --models', async () => {
@@ -139,6 +175,11 @@ describe('createSlashHandler', () => {
     expect(request).not.toHaveBeenCalledWith('slash.exec', expect.anything())
     await vi.waitFor(() => expect(ctx.transcript.panel).toHaveBeenCalledTimes(2))
     expect(ctx.transcript.panel).toHaveBeenCalledWith('🔬 [1/2] a:b', [{ text: '❌ failed: down' }])
+    // No model answered: nothing worth a chat.
+    await vi.waitFor(() =>
+      expect(ctx.transcript.sys).toHaveBeenCalledWith(expect.stringContaining('📊 comparison summary'))
+    )
+    expect(request).not.toHaveBeenCalledWith('compare.save', expect.anything())
   })
 
   it('handles /redraw locally without slash worker fallback', () => {

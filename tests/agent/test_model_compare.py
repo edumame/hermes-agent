@@ -91,6 +91,15 @@ class TestSavedSelection:
         assert mc.load_saved_candidates() == ["a:b"]
 
 
+class TestSavedSelectionClearing:
+    def test_empty_selection_clears_only_when_allowed(self, tmp_path):
+        mc.save_candidates(["a:m1"], tmp_path)
+        assert mc.save_candidates([], tmp_path) == []
+        assert mc.load_saved_candidates(tmp_path) == ["a:m1"]
+        assert mc.save_candidates([], tmp_path, allow_empty=True) == []
+        assert mc.load_saved_candidates(tmp_path) == []
+
+
 class TestSuggestions:
     def test_defaults_cap_per_provider_and_total(self):
         from agent.model_compare import SUGGEST_MAX_LABELS, suggest_candidate_labels
@@ -219,3 +228,67 @@ class TestFormatting:
         assert mc.format_cost(0) == "$0"
         assert mc.format_cost(0.0004) == "$0.0004"
         assert mc.format_cost(1.5) == "$1.50"
+
+
+class TestWireShape:
+    def test_to_dict_is_json_safe_with_decimal_cost(self):
+        import json
+        from decimal import Decimal
+        result = mc.CompareResult("p", "m", "p:m", text="hi", elapsed_s=1.25, cost_usd=Decimal("0.0123"), cost_status="ok")
+        data = result.to_dict()
+        assert data["cost_usd"] == 0.0123 and isinstance(data["cost_usd"], float)
+        assert data["elapsed_s"] == 1.25 and data["ok"] is True
+        json.dumps(data)  # the websocket transport's encoder must accept every field
+        assert mc.CompareResult("p", "m", "p:m", error="x").to_dict()["cost_usd"] is None
+
+
+class TestSavedComparison:
+    def test_results_round_trip_through_the_wire_shape(self):
+        results = [
+            mc.CompareResult("a", "m1", "a:m1", text="one", elapsed_s=1.25, input_tokens=3, output_tokens=4, cost_usd=0.5),
+            mc.CompareResult("b", "m2", "b:m2", error="boom", elapsed_s=0.1),
+        ]
+        back = mc.results_from_dicts([r.to_dict() for r in results])
+        assert [(r.provider, r.model, r.label, r.text, r.error, r.ok) for r in back] == [
+            ("a", "m1", "a:m1", "one", None, True), ("b", "m2", "b:m2", "", "boom", False)]
+        assert back[0].cost_usd == 0.5 and back[0].elapsed_s == 1.25 and back[0].output_tokens == 4
+
+    def test_results_from_loose_rows(self):
+        rows = [
+            {"model": "m", "provider": "p", "text": "x", "elapsed_s": "bad", "input_tokens": None},
+            {"model": "m2", "ok": False},  # a failed row with no message
+            {"model": "", "provider": "p"},  # dropped
+            "junk",
+        ]
+        back = mc.results_from_dicts(rows)
+        assert [(r.label, r.ok, r.error) for r in back] == [("p:m", True, None), ("m2", False, "failed")]
+        assert back[0].elapsed_s == 0.0 and back[0].input_tokens == 0
+
+    def test_chat_title_is_one_trimmed_line(self):
+        assert mc.comparison_chat_title("  why\n is the\tsky blue? ") == "Compare: why is the sky blue?"
+        long = mc.comparison_chat_title("word " * 40)
+        assert long.startswith("Compare: word word") and long.endswith("…") and len(long) <= 72
+
+    def test_chat_messages_keep_every_answer_untruncated(self):
+        results = [
+            mc.CompareResult("a", "m1", "a:m1", text="x" * 5000, elapsed_s=1.0),
+            mc.CompareResult("b", "m2", "b:m2", error="down"),
+        ]
+        messages = mc.comparison_chat_messages(" q ", results)
+        assert messages[0] == {"role": "user", "content": "q"}
+        answer = messages[1]["content"]
+        assert messages[1]["role"] == "assistant"
+        assert "x" * 5000 in answer and "truncated" not in answer
+        assert "[2/2] b:m2" in answer and "Failed: down" in answer and "Comparison summary" in answer
+
+    def test_label_only_failure_rows_parse(self):
+        back = mc.results_from_dicts([{"error": "down", "label": "openrouter:x/y"}, {"error": "down"}])
+        assert [(r.provider, r.model, r.label, r.error) for r in back] == [("openrouter", "x/y", "openrouter:x/y", "down")]
+
+    def test_branch_messages_and_title(self):
+        result = mc.CompareResult("openrouter", "anthropic/claude-sonnet-5", "openrouter:anthropic/claude-sonnet-5", text=" yes \n")
+        assert mc.branch_chat_messages(" q ", result) == [{"role": "user", "content": "q"}, {"role": "assistant", "content": "yes"}]
+        assert mc.branch_chat_title("why?", result) == "anthropic/claude-sonnet-5 · why?"
+        long = mc.branch_chat_title("word " * 30, result)
+        assert len(long) <= 72 and long.endswith("…")
+        assert mc.comparison_chat_messages("q", [result])[1]["display_kind"] == "compare"

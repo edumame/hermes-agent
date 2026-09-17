@@ -5,7 +5,11 @@ to compare through the gateway's clarify prompt in **multi-select** mode (button
 toggle rows + Done, native-poll adapters a multi-vote poll, everything else a numbered list the
 text-intercept parses as ``1, 3``), then fans the prompt out through ``agent/model_compare.py``
 and posts each answer as it lands. ``--models a:b,c:d`` skips the poll. The live session is never
-touched: no history rows, no model switch, no prompt-cache impact (same contract as ``/btw``).
+touched: no history rows, no model switch, no prompt-cache impact (same contract as ``/btw``). A
+finished run is saved as its OWN chat in the serving profile's session store — the same
+``agent.model_compare.persist_comparison_chat`` writer the desktop page and the TUI picker use through
+``compare.save`` — so the desktop sidebar lists it beside comparisons run anywhere else and it can be
+resumed there (before this the run lived only in the messaging thread and never reached the desktop).
 
 The models of the last comparison are saved per profile (``agent.model_compare.save_candidates``):
 a later bare ``/compare <prompt>`` reuses them without a poll — button rows cannot be pre-toggled
@@ -19,7 +23,7 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import List
+from typing import List, Optional
 
 from agent.model_compare import (
     SUGGEST_MAX_LABELS, SUGGEST_MODELS_PER_PROVIDER, parse_compare_args, parse_compare_options,
@@ -35,6 +39,11 @@ COMPARE_POLL_MAX_CHOICES = SUGGEST_MAX_LABELS
 _COMPARE_POLL_MODELS_PER_PROVIDER = SUGGEST_MODELS_PER_PROVIDER
 # A poll left unanswered releases the command well before the (hour-long) tool clarify default.
 COMPARE_POLL_TIMEOUT_S = 600
+# ``sessions.source`` of a comparison saved from a messaging ``/compare``. A LOCAL source id (the desktop
+# keeps ``gateway`` in its main Chats list, next to the TUI's ``tui`` and the page's ``desktop`` saves)
+# rather than the platform's own: the chat is the saved comparison, not a Telegram/Discord thread, so it
+# must not land in a platform section the desktop treats as a bot conversation.
+COMPARE_CHAT_SOURCE = "gateway"
 _parse_compare_args = parse_compare_args
 
 
@@ -131,6 +140,44 @@ class GatewayCompareCommandsMixin:
         reply = await asyncio.to_thread(clarify_mod.wait_for_response, clarify_id, float(timeout))
         return _decode_poll_reply(reply or "")
 
+    def _compare_chat_profile_name(self, source, profile_home) -> Optional[str]:
+        """The ``profile_name`` the saved chat is stamped with: the routed profile under multiplexing,
+        else the active one. None (unstamped) when that cannot be resolved — never a wrong name."""
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            name = ""
+            if profile_home is not None:
+                name = (getattr(source, "profile", None) or "").strip() or (self._profile_name_for_source(source) or "")
+            return name or get_active_profile_name() or "default"
+        except Exception:
+            return None
+
+    def _persist_comparison_chat(self, source, profile_home, prompt: str, results) -> Optional[str]:
+        """Save a finished run as its own chat in the serving profile's session store (the ONE writer
+        every surface shares, ``agent.model_compare.persist_comparison_chat``), so the desktop sidebar
+        and the TUI list it like a comparison run there and it can be resumed. Called inside the
+        profile scope: ``self._session_db`` then resolves that profile's ``state.db``. Returns the
+        chat's title, or None when nothing was saved: an all-failed run earns no chat (parity with the
+        TUI), and a store failure is logged, never raised — the answers were already delivered."""
+        from agent.model_compare import persist_comparison_chat
+        from hermes_state_ids import new_session_id
+
+        if not any(r.ok for r in results):
+            return None
+        try:
+            wrapper = self._session_db
+            db = getattr(wrapper, "_db", wrapper)  # AsyncSessionDB → the blocking SessionDB (we are off-loop)
+            if db is None:
+                logger.warning("/compare: session store unavailable, comparison not saved as a chat")
+                return None
+            _key, title = persist_comparison_chat(
+                db, prompt, list(results), session_id=new_session_id(), source=COMPARE_CHAT_SOURCE,
+                profile_name=self._compare_chat_profile_name(source, profile_home))
+            return title
+        except Exception as exc:
+            logger.warning("/compare: could not save the comparison as a chat: %s", exc, exc_info=True)
+            return None
+
     async def _handle_compare_command(self, event: MessageEvent) -> str:
         """Handle ``/compare [--models a:b,...] <prompt>``: poll (unless pinned), fan out, print."""
         from agent.model_compare import (
@@ -213,7 +260,14 @@ class GatewayCompareCommandsMixin:
 
                 results = await asyncio.to_thread(
                     _scoped, run_comparison, candidates, prompt, on_result=_on_result)
-                await adapter.send(source.chat_id, format_summary_message(results), metadata=reply_metadata)
+                summary = format_summary_message(results)
+                # Inside the profile scope so ``_session_db`` resolves the serving profile's store.
+                saved_title = await asyncio.to_thread(
+                    _scoped, self._persist_comparison_chat, source, profile_home, prompt, results)
+                if saved_title:
+                    summary += (f"\n\n💾 Saved as chat “{saved_title}” — open it in the desktop or TUI "
+                                f"to continue from these answers.")
+                await adapter.send(source.chat_id, summary, metadata=reply_metadata)
             except Exception as exc:
                 logger.warning("/compare failed: %s", exc, exc_info=True)
                 try:

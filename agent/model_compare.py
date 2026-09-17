@@ -70,8 +70,13 @@ class CompareResult:
         return self.error is None
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-safe wire shape. ``cost_usd`` arrives from usage pricing as a ``Decimal``, which
+        ``json.dumps`` rejects — the desktop's websocket reply silently died on it while the CLI,
+        which only formats the cost as text, was fine. Every number here is a plain float/int."""
         data = asdict(self)
         data["ok"] = self.ok
+        data["cost_usd"] = None if self.cost_usd is None else float(self.cost_usd)
+        data["elapsed_s"] = float(self.elapsed_s)
         return data
 
 
@@ -162,12 +167,15 @@ def load_saved_candidates(home: Union[str, Path, None] = None) -> List[str]:
     return normalize_candidate_labels(models) if isinstance(models, list) else []
 
 
-def save_candidates(labels: Iterable[Any], home: Union[str, Path, None] = None) -> List[str]:
+def save_candidates(labels: Iterable[Any], home: Union[str, Path, None] = None, *,
+                    allow_empty: bool = False) -> List[str]:
     """Persist ``labels`` as the selection the next comparison starts from; returns what was
-    stored. An empty selection is not written (a cancelled pick keeps the previous one). Write
-    failures are logged, never raised — remembering models must not break the comparison."""
+    stored. An empty selection is not written (a cancelled pick keeps the previous one) unless
+    ``allow_empty`` — a surface that edits the list in place (the desktop Compare page) clears it
+    on purpose. Write failures are logged, never raised — remembering models must not break the
+    comparison."""
     normalized = normalize_candidate_labels(labels)
-    if not normalized:
+    if not normalized and not allow_empty:
         return []
     try:
         from utils import atomic_json_write
@@ -380,13 +388,15 @@ def format_cost(cost_usd: Optional[float]) -> str:
     return f"${cost_usd:.2f}"
 
 
-def format_result_message(result: CompareResult, *, index: int, total: int, max_chars: int = 3500) -> str:
-    """Chat-ready rendering of one answer: a labelled header, the answer, and a stats footer."""
+def format_result_message(result: CompareResult, *, index: int, total: int,
+                          max_chars: Optional[int] = 3500) -> str:
+    """Chat-ready rendering of one answer: a labelled header, the answer, and a stats footer.
+    ``max_chars=None`` never truncates (a saved transcript keeps the whole answer)."""
     header = f"🔬 **[{index}/{total}] {result.label}**"
     if result.error:
         return f"{header}\n\n❌ Failed: {result.error}\n\n_{result.elapsed_s:.1f}s_"
     body = result.text.strip()
-    if len(body) > max_chars:
+    if max_chars is not None and len(body) > max_chars:
         body = body[:max_chars].rstrip() + "\n\n… _(truncated)_"
     footer = f"_{result.elapsed_s:.1f}s · {result.input_tokens}→{result.output_tokens} tokens · {format_cost(result.cost_usd)}_"
     return f"{header}\n\n{body}\n\n{footer}"
@@ -404,10 +414,131 @@ def format_summary_message(results: List[CompareResult]) -> str:
     return "\n".join(lines)
 
 
-def format_comparison_text(results: List[CompareResult], *, max_chars: int = 3500) -> str:
+def format_comparison_text(results: List[CompareResult], *, max_chars: Optional[int] = 3500) -> str:
     """One text block for a single-message surface (TUI slash output): every answer in candidate
     order, then the summary scoreboard."""
     total = len(results)
     parts = [format_result_message(r, index=i + 1, total=total, max_chars=max_chars) for i, r in enumerate(results)]
     parts.append(format_summary_message(results))
     return "\n\n".join(parts)
+
+
+# ── Saved comparisons (a finished run persisted as a chat) ───────────────────────────────────
+
+COMPARE_CHAT_TITLE_PREFIX = "Compare: "
+_CHAT_TITLE_MAX_CHARS = 72
+
+
+def results_from_dicts(items: Iterable[Any]) -> List[CompareResult]:
+    """Wire result rows (the ``CompareResult.to_dict`` shape ``compare.run`` returns, so a client can
+    hand back exactly what it was given) as results. A row naming only its ``label`` (a client's own
+    "request failed" row for a model the backend never answered for) takes provider/model from it; rows
+    naming neither are dropped. A row is a failure when it carries an ``error`` or says ``ok: false`` —
+    an empty error then reads "failed"."""
+    out: List[CompareResult] = []
+    for item in items or ():
+        if not isinstance(item, dict):
+            continue
+        model = str(item.get("model") or "").strip()
+        provider = str(item.get("provider") or "").strip()
+        label = str(item.get("label") or "").strip()
+        if not model:
+            parsed = parse_candidate(label) if label else None
+            if parsed is None:
+                continue
+            provider, model = parsed.provider, parsed.model
+        label = label or CompareCandidate(provider=provider, model=model).display
+        error = item.get("error")
+        error = str(error).strip() if error is not None and str(error).strip() else None
+        if error is None and item.get("ok") is False:
+            error = "failed"
+
+        def _num(key: str, cast, default):
+            try:
+                value = item.get(key)
+                return default if value is None else cast(value)
+            except (TypeError, ValueError):
+                return default
+
+        out.append(CompareResult(
+            provider=provider, model=model, label=label, text=str(item.get("text") or ""), error=error,
+            elapsed_s=_num("elapsed_s", float, 0.0), input_tokens=_num("input_tokens", int, 0),
+            output_tokens=_num("output_tokens", int, 0), cost_usd=_num("cost_usd", float, None),
+            cost_status=(str(item["cost_status"]) if item.get("cost_status") is not None else None)))
+    return out
+
+
+def comparison_chat_title(prompt: str) -> str:
+    """``Compare: <prompt>`` on one line, trimmed to a sidebar-sized title."""
+    text = " ".join(str(prompt or "").split())
+    budget = _CHAT_TITLE_MAX_CHARS - len(COMPARE_CHAT_TITLE_PREFIX)
+    if len(text) > budget:
+        text = text[:budget - 1].rstrip() + "…"
+    return f"{COMPARE_CHAT_TITLE_PREFIX}{text}"
+
+
+COMPARE_DISPLAY_KIND = "compare"
+
+
+def comparison_display_metadata(prompt: str, results: List[CompareResult]) -> Dict[str, Any]:
+    """Presentation payload stored beside the assistant turn (``display_metadata``): the structured
+    rows a renderer paints as side-by-side cards with a "branch with this model" action, instead of
+    the markdown it would otherwise show. The markdown stays the model-facing ``content``."""
+    return {"kind": COMPARE_DISPLAY_KIND, "version": 1, "prompt": str(prompt or "").strip(),
+            "results": [r.to_dict() for r in results]}
+
+
+def comparison_chat_messages(prompt: str, results: List[CompareResult]) -> List[Dict[str, Any]]:
+    """The transcript a saved comparison becomes: the prompt as the user turn, then every answer in
+    candidate order plus the scoreboard as ONE assistant turn (untruncated). One assistant turn, not one
+    per model, so the chat stays a valid alternating transcript when the user carries on in it. The
+    assistant turn is typed ``display_kind="compare"`` and carries the structured rows, so a client
+    that knows the kind renders cards; one that does not falls back to the markdown."""
+    return [
+        {"role": "user", "content": str(prompt or "").strip()},
+        {"role": "assistant", "content": format_comparison_text(results, max_chars=None),
+         "display_kind": COMPARE_DISPLAY_KIND, "display_metadata": comparison_display_metadata(prompt, results)},
+    ]
+
+
+def persist_comparison_chat(db, prompt: str, results: List[CompareResult], *, session_id: str, source: str,
+                            profile_name: Optional[str] = None, title: Optional[str] = None) -> tuple[str, str]:
+    """Write a finished comparison into ``db`` (a ``SessionDB``) as its own chat — the prompt as the user
+    turn, every answer plus the scoreboard as one typed assistant turn (``comparison_chat_messages``) —
+    under ``title`` (default ``Compare: <prompt>``; a duplicate title gets a ``(<id tail>)`` suffix, so
+    the same prompt compared twice keeps both chats). ONE writer for every surface: the desktop page
+    and the TUI picker go through ``compare.save``, the messaging ``/compare`` calls this directly, so a
+    Telegram run lands in the same store the desktop sidebar lists. Returns ``(session_id, title)``;
+    store errors propagate (callers decide whether a failed save is fatal)."""
+    title = (title or "").strip() or comparison_chat_title(prompt)
+    extra = {"profile_name": profile_name} if profile_name else {}
+    db.create_session(session_id, source=source, **extra)
+    db.append_messages_batch(session_id, comparison_chat_messages(prompt, results))
+    try:
+        db.set_session_title(session_id, title)
+    except ValueError:
+        title = f"{title} ({session_id[-6:]})"
+        db.set_session_title(session_id, title)
+    return session_id, title
+
+
+def branch_chat_messages(prompt: str, result: CompareResult) -> List[Dict[str, str]]:
+    """The transcript a branch off ONE compared model starts from: the prompt, then that model's own
+    answer as the assistant turn — the chat then continues on that model as if it had been asked alone."""
+    return [
+        {"role": "user", "content": str(prompt or "").strip()},
+        {"role": "assistant", "content": result.text.strip()},
+    ]
+
+
+def branch_chat_title(prompt: str, result: CompareResult) -> str:
+    """``<model> · <prompt>`` trimmed to a sidebar-sized title."""
+    text = " ".join(str(prompt or "").split())
+    prefix = f"{result.model} · "
+    budget = _CHAT_TITLE_MAX_CHARS - len(prefix)
+    if budget < 12:
+        prefix = prefix[:_CHAT_TITLE_MAX_CHARS - 13].rstrip() + "… · "
+        budget = _CHAT_TITLE_MAX_CHARS - len(prefix)
+    if len(text) > budget:
+        text = text[:budget - 1].rstrip() + "…"
+    return f"{prefix}{text}"

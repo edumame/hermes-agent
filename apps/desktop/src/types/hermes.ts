@@ -552,6 +552,9 @@ export type TimelineDisplayMetadata =
       display_text?: string
     }
   | { display_text: string }
+  /** A contributed presentation kind's payload (see `lib/message-kinds`):
+   *  opaque to core, parsed and handed to the plugin that claims the kind. */
+  | { kind: string; [key: string]: unknown }
   | { reactions: MessageReaction[] }
 
 /** One emoji reaction on a message. One per author, iOS-Tapback style. */
@@ -584,6 +587,7 @@ export interface SessionMessage {
   display_kind?:
     | 'async_delegation_complete'
     | 'auto_continue'
+    | 'compare'
     | 'hidden'
     | 'model_switch'
     | 'personality_switch'

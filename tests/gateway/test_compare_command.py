@@ -393,3 +393,132 @@ def test_compare_is_a_registered_gateway_command():
     assert "compare" in GatewayBusySessionMixin._IDLE_COMMANDS
     # Slack sits at its 50-slash cap; /compare rides /hermes compare there.
     assert "compare" in _SLACK_VIA_HERMES_ONLY
+
+
+class TestSavedAsChat:
+    """A finished messaging /compare is saved as its own chat in the profile's session store — the
+    same writer compare.save uses — so the desktop sidebar and the TUI list it (before, the run lived
+    only in the Telegram thread and never reached the desktop)."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    @staticmethod
+    def _pin_store(runner, tmp_path):
+        from hermes_state import AsyncSessionDB, SessionDB
+        db = SessionDB(tmp_path / "state.db")
+        runner._session_db = AsyncSessionDB(db)  # what the property serves in production
+        return db
+
+    @pytest.mark.asyncio
+    async def test_finished_run_lands_in_the_session_store(self, tmp_path):
+        from gateway.slash_commands_compare import COMPARE_CHAT_SOURCE
+        adapter = _FakeAdapter()
+        runner = _make_runner(adapter)
+        db = self._pin_store(runner, tmp_path)
+        with patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}), \
+                patch.object(runner, "_compare_listing", AsyncMock(return_value=([], "anthropic", "cur"))), \
+                patch("agent.model_compare.run_comparison", _fake_run_comparison):
+            await runner._handle_compare_command(_make_event("/compare --models a:m1,b:m2 why is the sky blue?"))
+            await _drain(runner)
+
+        rows = db.list_sessions_rich(limit=10)
+        assert len(rows) == 1
+        key = rows[0]["id"]
+        row = db.get_session(key)
+        assert row["source"] == COMPARE_CHAT_SOURCE  # a LOCAL source: main Chats list, not a Telegram section
+        assert db.get_session_title(key) == "Compare: why is the sky blue?"
+        messages = db.get_messages(key)
+        assert [m["role"] for m in messages] == ["user", "assistant"]
+        assert messages[0]["content"] == "why is the sky blue?"
+        assert "[1/2] a:m1" in messages[1]["content"] and "answer m2 to why is the sky blue?" in messages[1]["content"]
+        # The desktop renders the assistant turn as cards from the typed payload.
+        assert messages[1]["display_kind"] == "compare"
+        # The messaging user learns where the run went.
+        assert adapter.sent[-1].startswith("📊 **Comparison summary**")
+        assert "💾 Saved as chat “Compare: why is the sky blue?”" in adapter.sent[-1]
+
+    @pytest.mark.asyncio
+    async def test_same_prompt_twice_keeps_both_chats(self, tmp_path):
+        adapter = _FakeAdapter()
+        runner = _make_runner(adapter)
+        db = self._pin_store(runner, tmp_path)
+        with patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}), \
+                patch.object(runner, "_compare_listing", AsyncMock(return_value=([], "anthropic", "cur"))), \
+                patch("agent.model_compare.run_comparison", _fake_run_comparison):
+            for _ in range(2):
+                await runner._handle_compare_command(_make_event("/compare --models a:m1 q"))
+                await _drain(runner)
+        titles = sorted(db.get_session_title(r["id"]) for r in db.list_sessions_rich(limit=10))
+        assert titles[0] == "Compare: q" and titles[1].startswith("Compare: q (")
+
+    @pytest.mark.asyncio
+    async def test_all_failed_run_is_not_saved(self, tmp_path):
+        from agent.model_compare import CompareResult
+
+        def _all_fail(candidates, prompt, *, on_result=None, **_kw):
+            results = [CompareResult(c.provider, c.model, c.display, error="boom") for c in candidates]
+            for i, r in enumerate(results):
+                on_result(r, i + 1, len(results))
+            return results
+
+        adapter = _FakeAdapter()
+        runner = _make_runner(adapter)
+        db = self._pin_store(runner, tmp_path)
+        with patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}), \
+                patch.object(runner, "_compare_listing", AsyncMock(return_value=([], "anthropic", "cur"))), \
+                patch("agent.model_compare.run_comparison", _all_fail):
+            await runner._handle_compare_command(_make_event("/compare --models a:m1,b:m2 q"))
+            await _drain(runner)
+        assert db.list_sessions_rich(limit=10) == []
+        assert adapter.sent[-1].startswith("📊") and "Saved as chat" not in adapter.sent[-1]
+
+    @pytest.mark.asyncio
+    async def test_store_failure_never_loses_the_summary(self, tmp_path):
+        adapter = _FakeAdapter()
+        runner = _make_runner(adapter)
+        runner._session_db = None  # store unavailable (what the property serves while SQLite is down)
+        with patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}), \
+                patch.object(runner, "_compare_listing", AsyncMock(return_value=([], "anthropic", "cur"))), \
+                patch("agent.model_compare.run_comparison", _fake_run_comparison):
+            await runner._handle_compare_command(_make_event("/compare --models a:m1 q"))
+            await _drain(runner)
+        assert adapter.sent[-1].startswith("📊 **Comparison summary**")
+        assert "Saved as chat" not in adapter.sent[-1]
+
+    @pytest.mark.asyncio
+    async def test_multiplexed_run_is_saved_in_the_routed_profile_store(self, tmp_path):
+        """Under multiplexing the save runs inside the profile scope, so the chat lands in THAT
+        profile's store (what the desktop lists for the profile), stamped with its name."""
+        from hermes_state import AsyncSessionDB, SessionDB
+        adapter = _FakeAdapter()
+        runner = _make_runner(adapter)
+        runner.config = SimpleNamespace(multiplex_profiles=True)
+        profile = tmp_path / "profiles" / "work"
+        profile.mkdir(parents=True)
+        runner._resolve_profile_home_for_source = lambda source: profile
+        runner._profile_name_for_source = lambda source, adapter_profile=None: "work"
+        profile_db = SessionDB(profile / "state.db")
+        scoped_homes: list = []
+
+        # In production the property resolves the store from the scoped HERMES_HOME; pin it here.
+        runner._session_db = AsyncSessionDB(profile_db)
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def _scope(home, *a, **k):
+            scoped_homes.append(home)
+            yield
+
+        with patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}), \
+                patch.object(runner, "_compare_listing", AsyncMock(return_value=([], "anthropic", "cur"))), \
+                patch("agent.model_compare.run_comparison", _fake_run_comparison), \
+                patch("gateway.run._profile_runtime_scope", _scope):
+            await runner._handle_compare_command(_make_event("/compare --models a:m1 q"))
+            await _drain(runner)
+        rows = profile_db.list_sessions_rich(limit=10)
+        assert len(rows) == 1
+        assert profile_db.get_session(rows[0]["id"])["profile_name"] == "work"
+        # Both the fan-out and the save ran inside the profile scope.
+        assert scoped_homes == [profile, profile]
